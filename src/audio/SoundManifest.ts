@@ -42,7 +42,7 @@ const D = publicUrl('Audio/');
 export const SOUND_MANIFEST: readonly SoundDef[] = [
   {
     id: 'step_monster_far',
-    url: D + 'monster_step_far_01.wav',
+    url: D + 'monster_step_far_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 0.9,
@@ -53,7 +53,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'step_monster_near',
-    url: D + 'monster_step_near_01.wav',
+    url: D + 'monster_step_near_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 1.0,
@@ -64,7 +64,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'step_monster_chase',
-    url: D + 'monster_step_chase_01.wav',
+    url: D + 'monster_step_chase_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 1.0,
@@ -75,7 +75,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'breath_close',
-    url: D + 'monster_breath_close.wav',
+    url: D + 'monster_breath_close.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.75,
@@ -85,7 +85,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'breath_heavy',
-    url: D + 'monster_breath_heavy.wav',
+    url: D + 'monster_breath_heavy.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.95,
@@ -95,7 +95,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'growl_low',
-    url: D + 'monster_growl_low.wav',
+    url: D + 'monster_growl_low.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.7,
@@ -105,7 +105,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'growl_aggressive',
-    url: D + 'monster_growl_aggro.wav',
+    url: D + 'monster_growl_aggro.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.9,
@@ -115,7 +115,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'roar_detect',
-    url: D + 'monster_roar_detect.wav',
+    url: D + 'monster_roar_detect.ogg',
     loop: false,
     positional: true,
     baseVolume: 1.0,
@@ -125,7 +125,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'scratch_loop',
-    url: D + 'monster_scratch.wav',
+    url: D + 'monster_scratch.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.85,
@@ -135,7 +135,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'sniff_loop',
-    url: D + 'monster_sniff.wav',
+    url: D + 'monster_sniff.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.7,
@@ -145,21 +145,21 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'heartbeat',
-    url: D + 'player_heartbeat.wav',
+    url: D + 'player_heartbeat.ogg',
     loop: true,
     positional: false,
     baseVolume: 1.0
   },
   {
     id: 'amb_room_tone',
-    url: D + 'amb_room_tone.wav',
+    url: D + 'amb_room_tone.ogg',
     loop: true,
     positional: false,
     baseVolume: 0.5
   },
   {
     id: 'amb_vent',
-    url: D + 'amb_vent_loop.wav',
+    url: D + 'amb_vent_loop.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.5,
@@ -169,7 +169,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'amb_electrical',
-    url: D + 'amb_electrical_hum.wav',
+    url: D + 'amb_electrical_hum.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.4,
@@ -179,7 +179,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'sfx_metal_creak',
-    url: D + 'sfx_metal_creak_01.wav',
+    url: D + 'sfx_metal_creak_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 0.6,
@@ -190,7 +190,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'sfx_distant_impact',
-    url: D + 'sfx_distant_impact_01.wav',
+    url: D + 'sfx_distant_impact_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 0.55,
@@ -201,7 +201,7 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
   },
   {
     id: 'sfx_door_slam',
-    url: D + 'sfx_door_slam_01.wav',
+    url: D + 'sfx_door_slam_01.ogg',
     loop: false,
     positional: true,
     baseVolume: 0.8,
@@ -218,28 +218,28 @@ export const SOUND_MANIFEST: readonly SoundDef[] = [
    */
   {
     id: 'sting_detect',
-    url: D + 'sting_detect_01.wav',
+    url: D + 'sting_detect_01.ogg',
     loop: false,
     positional: false,
     baseVolume: 1.0
   },
   {
     id: 'sting_lost',
-    url: D + 'sting_lost_01.wav',
+    url: D + 'sting_lost_01.ogg',
     loop: false,
     positional: false,
     baseVolume: 0.6
   },
   {
     id: 'sting_caught',
-    url: D + 'sting_caught_01.wav',
+    url: D + 'sting_caught_01.ogg',
     loop: false,
     positional: false,
     baseVolume: 1.0
   },
   {
     id: 'whisper_close',
-    url: D + 'monster_whisper_close.wav',
+    url: D + 'monster_whisper_close.ogg',
     loop: true,
     positional: true,
     baseVolume: 0.55,
@@ -308,4 +308,5 @@ export class SoundBank {
     return definition;
   }
 }
+
 
