@@ -1,13 +1,13 @@
+
 import type { GameMode } from './types';
 
 const TRANSITIONS: Record<GameMode, readonly GameMode[]> = {
-  menu: ['howto', 'intro', 'playing'],
-  howto: ['menu', 'intro', 'playing'],
-  intro: ['playing', 'menu'],
-  playing: ['paused', 'caught', 'complete', 'intro', 'menu'],
-  paused: ['playing', 'intro', 'menu'],
-  caught: ['playing', 'intro', 'menu'],
-  complete: ['intro', 'playing', 'menu'],
+  menu: ['howto', 'playing'],
+  howto: ['menu', 'playing'],
+  playing: ['paused', 'caught', 'complete', 'menu'],
+  paused: ['playing', 'menu'],
+  caught: ['playing', 'menu'],
+  complete: ['playing', 'menu'],
 };
 
 export type ModeListener = (to: GameMode, from: GameMode) => void;
@@ -53,6 +53,7 @@ export class GameStateMachine {
 
   onChange(listener: ModeListener): () => void {
     this.listeners.add(listener);
+
     return () => {
       this.listeners.delete(listener);
     };

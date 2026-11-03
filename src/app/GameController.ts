@@ -1,7 +1,15 @@
 import * as THREE from 'three';
 import type { GameServices } from './GameServices';
-import type { GameMode } from '../core/types';
+import type {
+  GameMode,
+  MonsterState as CoreMonsterState,
+  SoundEvent as CoreSoundEvent,
+  InventoryItem,
+  DrawerKeyId,
+} from '../core/types';
+import { PAPER_PASSWORD_ID } from '../core/types';
 import { DisposableStore, getLiveDomListeners, type Disposable } from '../core/Disposable';
+import { createRng } from '../core/Random';
 import { RestartSystem } from '../gameplay/RestartSystem';
 import { getInteractionPrompt, getObjective } from '../gameplay/ObjectiveSystem';
 import { crawlspaceAt } from '../world/LevelLayout';
@@ -15,7 +23,15 @@ import { PaperSheet } from '../ui/PaperSheet';
 import type { MonsterState as FeatureMonsterState } from '../integration/GameHooks';
 import { PAPER_PLACEMENTS } from '../Documents/PaperPlacements';
 import { getDocumentById } from '../Documents/DocumentRegistry';
-import type { MonsterState as CoreMonsterState, SoundEvent as CoreSoundEvent } from '../core/types';
+
+import {
+  PuzzleInventory,
+  PUZZLE_INVENTORY_SNAPSHOT_VERSION,
+  type CollectibleItemId,
+  type PuzzleInventoryItemId,
+} from '../gameplay/PuzzleInventory';
+import { DrawerSystem, type DrawerInventorySink } from '../gameplay/DrawerSystem';
+import { FacilityPuzzleSystem, PasswordLocker, type IPuzzleInventory } from '../gameplay/FacilityPuzzleSystem';
 
 export interface Diagnostics {
   mode: GameMode;
@@ -40,6 +56,63 @@ function mapMonsterState(state: CoreMonsterState): FeatureMonsterState {
   }
 }
 
+/**
+ * Adapts the id-based `PuzzleInventory` (which only knows item ids, not full
+ * `InventoryItem` objects — it builds those internally from its own
+ * ITEM_DEFINITIONS table) onto the two item-object-based surfaces that
+ * `DrawerSystem` (`DrawerInventorySink`) and `FacilityPuzzleSystem`
+ * (`IPuzzleInventory`) expect. This is the single place that bridges the two
+ * shapes, so neither gameplay class needs to know about the other's API.
+ */
+class PuzzleInventoryBridge implements IPuzzleInventory, DrawerInventorySink {
+  constructor(private readonly inv: PuzzleInventory) {}
+
+  private grantOne(item: InventoryItem): void {
+    // `combined_object` is never added directly — PuzzleInventory only ever
+    // creates it via combineFragments() once all 3 fragments are present.
+    if (item.id === 'combined_object') {
+      this.inv.combineFragments();
+      return;
+    }
+    this.inv.add(item.id as CollectibleItemId);
+  }
+
+  grant(item: InventoryItem): void {
+    this.grantOne(item);
+  }
+
+  addItem(item: InventoryItem): void {
+    this.grantOne(item);
+  }
+
+  hasItem(id: DrawerKeyId): boolean {
+    return this.inv.has(id);
+  }
+
+  has(itemId: InventoryItem['id']): boolean {
+    return this.inv.has(itemId as PuzzleInventoryItemId);
+  }
+
+  items(): readonly InventoryItem[] {
+    return this.inv.list();
+  }
+
+  serialize(): InventoryItem[] {
+    return [...this.inv.list()];
+  }
+
+  restore(items: readonly InventoryItem[]): void {
+    this.inv.restore({
+      version: PUZZLE_INVENTORY_SNAPSHOT_VERSION,
+      items: items.map((i) => i.id) as PuzzleInventoryItemId[],
+    });
+  }
+
+  reset(): void {
+    this.inv.clear();
+  }
+}
+
 /** Game flow: mode changes, input routing (temporary until the Stage D InputManager), per-frame update and HUD. */
 export class GameController implements Disposable {
   private readonly disposables = new DisposableStore();
@@ -58,6 +131,8 @@ export class GameController implements Disposable {
   private inputLocked = false;
   /** A4 handwritten paper overlay. Used by every 'paper' interactable (world notes and document pickups). */
   private readonly paper = new PaperSheet();
+  /** Full puzzle progression. Created once; reseeded per run. */
+  private puzzle: FacilityPuzzleSystem | null = null;
 
   constructor(private readonly s: GameServices) {
     this.restart = new RestartSystem(s);
@@ -81,6 +156,10 @@ export class GameController implements Disposable {
       }
       s.state.transition('complete');
     }));
+    this.disposables.add(s.events.on('puzzle:stage', (payload: { to: string }) => {
+      this.toast(payload.to);
+      this.persistPuzzle();
+    }));
     this.disposables.addListener(window, 'keydown', this.onKeyDown as EventListener);
     this.disposables.addListener(window, 'resize', this.onResize as EventListener);
     this.disposables.addListener(document, 'visibilitychange', () => {
@@ -95,9 +174,39 @@ export class GameController implements Disposable {
     // Audio listener must ride on the same camera the renderer uses, so positional/occlusion audio lines up.
     s.player.camera.add(this.audioListener);
 
+    this.setupPuzzle(0);
     void this.setupFeatures();
 
     s.ui.showMenu();
+  }
+
+  /**
+   * Constructs the puzzle stack in dependency order: inventory -> drawers -> locker -> orchestrator.
+   * `FacilityPuzzleSystem` builds its own internal `FragmentCombinationSystem`
+   * (it needs a range-check callback that closes over the orchestrator itself,
+   * so that system is never pre-built here). The orchestrator is handed to the
+   * player as its PuzzleHost; the player never owns puzzle state.
+   */
+  private setupPuzzle(seed: number): void {
+    const { s } = this;
+    const inventory = new PuzzleInventory();
+    const inventoryBridge = new PuzzleInventoryBridge(inventory);
+    const rng = createRng(seed);
+    const drawers = new DrawerSystem(s.world, rng, inventoryBridge, s.events);
+    const locker = new PasswordLocker(s.world, s.events);
+
+    this.puzzle = new FacilityPuzzleSystem({
+      world: s.world,
+      player: s.player,
+      inventory: inventoryBridge,
+      drawers: drawers as unknown as ConstructorParameters<typeof FacilityPuzzleSystem>[0]['drawers'],
+      locker,
+      events: s.events,
+      seed,
+    });
+    s.player.setPuzzleHost(
+      this.puzzle as unknown as Parameters<typeof s.player.setPuzzleHost>[0],
+    );
   }
 
   /**
@@ -124,6 +233,11 @@ export class GameController implements Disposable {
       onDocumentCollected: (id: string) => {
         const doc = getDocumentById(id);
         this.toast(doc ? `Document added to journal: ${doc.title}` : 'Document added to journal.');
+        // The single password paper teaches the locker code; tell the puzzle system when it is read.
+        if (id === PAPER_PASSWORD_ID) {
+          this.puzzle?.notePasswordDiscovered();
+          this.persistPuzzle();
+        }
       },
       onCaught: (callback: () => void) => s.events.on('caught', callback),
       onSoundEvent: (callback: (event: CoreSoundEvent) => void) =>
@@ -137,11 +251,8 @@ export class GameController implements Disposable {
         renderer: s.renderer.renderer,
         listener: this.audioListener,
         fallbackPlacements: PAPER_PLACEMENTS,
-        // The project's existing main-menu / how-to-play flow is the established onboarding UX; the feature
-        // set's own narrative intro overlay is left available but off by default to avoid two competing
-        // full-screen intros. Flip to true (or call featureSet.unlockAudio() explicitly) once verified in a
-        // real browser.
-        playIntro: false,
+        // Show the cinematic briefing and controls before the player begins exploring.
+        playIntro: true,
         paper: this.paper,
       });
 
@@ -187,6 +298,8 @@ export class GameController implements Disposable {
     else if (to === 'playing' && from === 'paused') this.paper.resume();
     else this.paper.close('forced');
     this.s.loop.paused = to !== 'playing';
+    // Puzzle interactables are inert outside active gameplay, so prompts and raycast hits cannot leak.
+    this.s.world.setPuzzleActive(to === 'playing');
     this.s.events.emit('modechange', { from, to });
     if (to === 'playing') this.features?.unlockAudio();
     switch (to) {
@@ -199,30 +312,43 @@ export class GameController implements Disposable {
     }
   }
 
-  /** Starts a brand-new run: fresh seed, keycard relocated. */
+  /** Starts a brand-new run: fresh seed, keycard relocated, puzzle layout rebuilt from that seed. */
   startGame(): void {
     const seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
     this.save = createNewSave(CHAPTER_01_CAMPAIGN.id, seed);
-    this.saves.save(this.save);
     this.beginChapter(seed);
+    this.persistPuzzle();
   }
 
-  /** Continues the last save: same seed, so the keycard stays exactly where it was. */
+  /** Continues the last save: same seed, so the keycard and every drawer stay exactly where they were. */
   continueGame(): void {
     const loaded = this.saves.load();
     if (!loaded) { this.startGame(); return; }
     this.save = loaded;
     this.beginChapter(loaded.runSeed);
+    if (loaded.puzzle) this.puzzle?.restore(loaded.puzzle);
   }
 
   private beginChapter(seed: number): void {
     this.paper.close('forced');
     this.restart.reset();
     this.s.world.placeKeycardForSeed(seed);
+    this.puzzle?.reset(seed);
     this.objective = getObjective(false);
     this.crawlHinted = false;
     if (!this.s.state.transition('playing')) this.enter('playing', 'playing');
     this.toast('CONTAINMENT BREACH: Find a way out. Search the facility and stay quiet.');
+  }
+
+  /** Persists the live puzzle snapshot into the current save. Called on stage and item changes. */
+  private persistPuzzle(): void {
+    if (!this.save || !this.puzzle) return;
+    const updated: SaveData = {
+      ...this.save,
+      puzzle: this.puzzle.snapshot() as unknown as SaveData['puzzle'],
+    };
+    this.save = updated;
+    this.saves.save(updated);
   }
 
   returnToMenu(): void {
@@ -246,8 +372,16 @@ export class GameController implements Disposable {
     if (this.features && (this.features.reader.isOpen || this.features.journal.isOpen)) return;
     if (k === 'e') {
       const readPaper = this.features?.pickups.interact() ?? false;
-      if (!readPaper) player.interact();
+      if (!readPaper) {
+        player.interact();
+        this.persistPuzzle();
+      }
       return;
+    }
+    // Q combines fragments. F stays bound to the flashlight below.
+    if (k === 'q') {
+      this.puzzle?.combineFragments();
+      this.persistPuzzle();
     }
     if (k === 'g') player.throwDistraction();
     if (k === 'f') player.toggleFlashlight(flashlight.light);
@@ -260,7 +394,7 @@ export class GameController implements Disposable {
   private toast(text: string): void {
     this.s.ui.toast(text);
     this.toastTimer = text ? this.s.config.ui.toastSeconds : 0;
-  }
+  };
 
   private step = (dt: number, time: number): void => {
     if (!this.s.state.is('playing')) return;
@@ -276,6 +410,8 @@ export class GameController implements Disposable {
       this.toastTimer -= dt;
       if (this.toastTimer <= 0) this.toast('');
     }
+    // Puzzle animations and timers only advance while playing; pausing freezes them.
+    if (!this.inputLocked && !this.paper.isOpen) this.puzzle?.update(dt);
     this.objective = getObjective(player.hasKeycard);
     this.features?.update(dt);
   };
@@ -332,6 +468,9 @@ export class GameController implements Disposable {
     this.paper.dispose();
     this.features?.dispose();
     this.features = null;
+    this.s.player.setPuzzleHost(null);
+    this.puzzle?.dispose();
+    this.puzzle = null;
     this.s.player.camera.remove(this.audioListener);
     this.disposables.dispose();
   }

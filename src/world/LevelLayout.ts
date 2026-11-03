@@ -21,8 +21,21 @@
  * Crawlspaces: seven tiny closets whose only entrance is a 0.88 m gap. The player (radius 0.35) fits; Subject 09
  * (radius 0.45) physically does not, and the navigation graph uses the same radius, so it can never path inside.
  * Five "service gaps" in room walls work the same way as player-only shortcuts.
+ *
+ * PUZZLE LAYER (appended, data only):
+ *   Decontamination is the restricted room (the only room here with no crawlspace). Its Mess doorway carries the
+ *   three locks. Records Archive is the keycard room, opened by the box key. 20 drawers are spread across the whole
+ *   facility; the seeded system picks 3 of them at runtime. Papers live in Records.
+ *   Known shortcut: Exit Hall crawl -> Specimen -> Decon bypasses the locks. Deliberate, long, through a dead end.
  */
 import type { FacilityLayout } from './FacilityLayout';
+import type {
+  DrawerId,
+  DrawerKeyId,
+  FragmentId,
+  LockId,
+  PuzzleObjectId
+} from '../core/types';
 
 export interface Point2 { x: number; z: number }
 export type Facing = '+z' | '-z' | '+x' | '-x';
@@ -59,6 +72,48 @@ export interface SignSpec {
 }
 export interface NoteSpec extends Point2 { label: string; text: string }
 
+/* ---- puzzle placement specs (data only; meshes are built by WorldManager) ---- */
+
+/** A searchable drawer unit standing against a wall. `facing` points out of the wall into the room. */
+export interface DrawerSpec extends Point2 {
+  id: DrawerId;
+  facing: Facing;
+  roomId: string;
+  label: string;
+}
+
+export interface KeySpec {
+  id: DrawerKeyId;
+  label: string;
+  /** Lock this key opens. */
+  lockId: LockId;
+}
+
+/** One tumbler of the restricted-room door. `axis` is the wall the lock plate sits on. */
+export interface LockSpec extends Point2 {
+  id: LockId;
+  accepts: DrawerKeyId;
+  axis: 'x' | 'z';
+  doorId: string;
+}
+
+/** A fragment resting on an existing prop surface; `surfaceY` is that prop's height. */
+export interface FragmentSpec extends Point2 {
+  id: FragmentId;
+  label: string;
+  surfaceY: number;
+  hostKind: PropKind;
+  roomId: string;
+}
+
+/** Any single-instance puzzle object placed in the world. */
+export interface PuzzleObjectSpec extends Point2 {
+  id: PuzzleObjectId;
+  label: string;
+  roomId: string;
+  y?: number;
+}
+
 export const WALL_T = 0.8;
 export const DOOR_WIDTH = 3;
 export const CRAWL_GAP = 0.88;
@@ -66,7 +121,9 @@ export const CRAWL_GAP = 0.88;
 export const WORLD_BOUNDS = { minX: -30.4, maxX: 30.4, minZ: -24.4, maxZ: 40.4 } as const;
 export const PLAYER_START = { x: -20, z: 18, yaw: -Math.PI / 2 } as const;
 export const EXIT_POSITION: Point2 = { x: 29.2, z: 14 };
-export const KEYCARD_POSITION: Point2 = { x: 28.3, z: -22.5 };
+/** Keycard now spawns from the password locker in the Records Archive. */
+export const KEYCARD_POSITION: Point2 = { x: 28.6, z: -9.5 };
+export const KEYCARD_REWARD_POSITION: Point2 = { x: 28.6, z: -9.5 };
 
 interface Gap { c: number; w: number }
 const door = (c: number): Gap => ({ c, w: DOOR_WIDTH });
@@ -324,6 +381,128 @@ export const EXIT_SOLIDS: SolidSpec[] = [
   { x: 29.55, z: 14, w: 0.25, d: 3.0 },
 ];
 
+// =================================================================================================================
+// PUZZLE PLACEMENT DATA
+// =================================================================================================================
+
+export const DRAWER_SIZE = { w: 0.8, d: 0.45 } as const;
+
+/** Restricted room (3-lock access door) and the keycard room. */
+export const RESTRICTED_ROOM_ID = 'decon';
+export const KEYCARD_ROOM_ID = 'records';
+
+/** The three-lock access door into the restricted room. Matches the Mess->Decon doorway at x=-3.5, z=24. */
+export const ACCESS_DOOR_POSITION: Point2 = { x: -3.5, z: 24 };
+
+/**
+ * 20 searchable drawer units. Exactly three receive a key at runtime (seeded).
+ * All sit 0.8 m off a wall face, clear of doorways, lockers, props and crawl gaps.
+ */
+export const PUZZLE_DRAWERS: DrawerSpec[] = [
+  { id: 'drawer_01', x: -29.2, z: -12, facing: '+x', roomId: 'lab', label: 'Lab drawer' },
+  { id: 'drawer_02', x: -29.2, z: -16.5, facing: '+x', roomId: 'lab', label: 'Lab drawer' },
+  { id: 'drawer_03', x: -18.5, z: -22.9, facing: '+z', roomId: 'lab', label: 'Lab drawer' },
+  { id: 'drawer_04', x: -29.2, z: -6.5, facing: '+x', roomId: 'storage', label: 'Storage drawer' },
+  { id: 'drawer_05', x: -29.2, z: 1.5, facing: '+x', roomId: 'storage', label: 'Storage drawer' },
+  { id: 'drawer_06', x: -24.5, z: -7.2, facing: '+z', roomId: 'storage', label: 'Storage drawer' },
+  { id: 'drawer_07', x: -9.5, z: -22.9, facing: '+z', roomId: 'hall', label: 'Hall drawer' },
+  { id: 'drawer_08', x: 4.5, z: -22.9, facing: '+z', roomId: 'hall', label: 'Hall drawer' },
+  { id: 'drawer_09', x: 14.5, z: -22.9, facing: '+z', roomId: 'records', label: 'Archive drawer' },
+  { id: 'drawer_10', x: 26.5, z: -22.9, facing: '+z', roomId: 'records', label: 'Archive drawer' },
+  { id: 'drawer_11', x: 29.2, z: -16, facing: '-x', roomId: 'records', label: 'Archive drawer' },
+  { id: 'drawer_12', x: 29.2, z: -6.5, facing: '-x', roomId: 'security', label: 'Security drawer' },
+  { id: 'drawer_13', x: 12.4, z: -6.5, facing: '+x', roomId: 'security', label: 'Security drawer' },
+  { id: 'drawer_14', x: 24.5, z: 6.9, facing: '-z', roomId: 'security', label: 'Security drawer' },
+  { id: 'drawer_15', x: -12.2, z: 10.5, facing: '+x', roomId: 'ward', label: 'Ward drawer' },
+  { id: 'drawer_16', x: -29.2, z: 9, facing: '+x', roomId: 'ward', label: 'Ward drawer' },
+  { id: 'drawer_17', x: -9.5, z: 22.9, facing: '-z', roomId: 'mess', label: 'Mess drawer' },
+  { id: 'drawer_18', x: 9.5, z: 15.5, facing: '-x', roomId: 'mess', label: 'Mess drawer' },
+  { id: 'drawer_19', x: -29.2, z: 26.5, facing: '+x', roomId: 'generator', label: 'Generator drawer' },
+  { id: 'drawer_20', x: 9.8, z: 31, facing: '-x', roomId: 'decon', label: 'Decon drawer' },
+];
+
+/** Exactly three keys, one per lock. */
+export const PUZZLE_KEYS: KeySpec[] = [
+  { id: 'drawer_key_1', label: 'Brass key', lockId: 'lock_1' },
+  { id: 'drawer_key_2', label: 'Steel key', lockId: 'lock_2' },
+  { id: 'drawer_key_3', label: 'Tarnished key', lockId: 'lock_3' },
+];
+
+/** Three locks across the 3 m access door: left, centre, right. */
+export const PUZZLE_LOCKS: LockSpec[] = [
+  { id: 'lock_1', x: -4.4, z: 24, axis: 'x', accepts: 'drawer_key_1', doorId: 'access_door' },
+  { id: 'lock_2', x: -3.5, z: 24, axis: 'x', accepts: 'drawer_key_2', doorId: 'access_door' },
+  { id: 'lock_3', x: -2.6, z: 24, axis: 'x', accepts: 'drawer_key_3', doorId: 'access_door' },
+];
+
+/** Fragments rest on existing prop tops; surfaceY matches the host prop height. */
+export const PUZZLE_FRAGMENTS: FragmentSpec[] = [
+  { id: 'fragment_1', x: 7.5, z: 26.5, surfaceY: 1.0, hostKind: 'counter', roomId: 'decon', label: 'Matte fragment' },
+  { id: 'fragment_2', x: 9.2, z: 37.4, surfaceY: 1.2, hostKind: 'crate', roomId: 'decon', label: 'Matte fragment' },
+  { id: 'fragment_3', x: -10.1, z: 27.0, surfaceY: 1.2, hostKind: 'console', roomId: 'decon', label: 'Matte fragment' },
+];
+
+/** Combination box, centred in the restricted room's open floor between the pillars. */
+export const PUZZLE_BOX: PuzzleObjectSpec = { id: 'combination_box', x: 0, z: 33, roomId: 'decon', label: 'Combination box' };
+
+/** Keyed door into the keycard room (Records Archive), on the Atrium boundary. */
+export const KEYCARD_ROOM_DOOR: PuzzleObjectSpec = { id: 'keycard_room_door', x: 11, z: -14, roomId: 'records', label: 'Archive door' };
+
+/** Password locker against the Records Archive east wall. */
+export const PASSWORD_LOCKER: PuzzleObjectSpec = { id: 'password_locker', x: 29.2, z: -9.5, roomId: 'records', label: 'Archive locker' };
+
+/** Where the keycard spawns once the locker opens. */
+export const KEYCARD_REWARD: PuzzleObjectSpec = { id: 'keycard', x: 28.6, z: -9.5, roomId: 'records', y: 1.1, label: 'Security keycard' };
+
+/** Everything single-instance, for WorldManager to iterate. */
+export const PUZZLE_OBJECTS: PuzzleObjectSpec[] = [
+  PUZZLE_BOX,
+  KEYCARD_ROOM_DOOR,
+  PASSWORD_LOCKER,
+  KEYCARD_REWARD,
+  ...PUZZLE_LOCKS.map((l): PuzzleObjectSpec => ({ id: l.id, x: l.x, z: l.z, roomId: RESTRICTED_ROOM_ID, label: `Lock ${l.id.slice(-1)}` })),
+];
+
+/** Footprint for collision; drawers are shallow so they never narrow an aisle below player width. */
+export function drawerSolid(d: DrawerSpec): SolidSpec {
+  const alongX = d.facing === '+z' || d.facing === '-z';
+  return {
+    x: d.x,
+    z: d.z,
+    w: alongX ? DRAWER_SIZE.w : DRAWER_SIZE.d,
+    d: alongX ? DRAWER_SIZE.d : DRAWER_SIZE.w,
+    blocksSight: false,
+  };
+}
+
+/** Every footprint that blocks walking, for the game's collision, the nav graph and headless tests. */
+export function getSolids(): SolidSpec[] {
+  return [
+    ...WALLS.map((w): SolidSpec => ({ x: w.x, z: w.z, w: w.w, d: w.d, blocksSight: true })),
+    ...PROPS.map((p): SolidSpec => ({ x: p.x, z: p.z, w: p.w, d: p.d, blocksSight: p.blocksSight ?? true })),
+    ...LOCKERS.map((l): SolidSpec => ({ ...lockerSolid(l), blocksSight: true })),
+    ...EXIT_SOLIDS.map((s): SolidSpec => ({ ...s, blocksSight: true })),
+    ...PUZZLE_DRAWERS.map(drawerSolid),
+  ];
+}
+
+/** Which crawlspace interior (if any) contains this point. */
+export function crawlspaceAt(x: number, z: number): CrawlspaceSpec | null {
+  for (const c of CRAWLSPACES) {
+    const i = c.interior;
+    if (x >= i.minX && x <= i.maxX && z >= i.minZ && z <= i.maxZ) return c;
+  }
+  return null;
+}
+
+/** Which room contains this point (inclusive bounds). */
+export function roomAt(x: number, z: number): RoomSpec | null {
+  for (const r of ROOMS) {
+    if (x >= r.minX && x <= r.maxX && z >= r.minZ && z <= r.maxZ) return r;
+  }
+  return null;
+}
+
 /** (x, z) is the point on the wall face; rotY is the direction the sign faces (0 = +z, PI = -z, PI/2 = +x, -PI/2 = -x). */
 export const SIGNS: SignSpec[] = [
   { text: 'RECOVERY WARD', code: 'B2-W', tone: 'safe', x: -20, y: 3.0, z: 8.45, rotY: 0, color: 0x9fe0cc },
@@ -340,6 +519,9 @@ export const SIGNS: SignSpec[] = [
   { text: 'GENERATOR ROOM', code: 'PWR', tone: 'restricted', x: -24, y: 3.0, z: 24.45, rotY: 0, color: 0xe0b060 },
   { text: 'DECONTAMINATION', code: 'DEC', tone: 'clinical', x: 2, y: 3.0, z: 24.45, rotY: 0, color: 0x8dd6e6 },
   { text: 'SPECIMEN STORAGE', code: 'SPC', tone: 'danger', x: 18, y: 3.0, z: 24.45, rotY: 0, color: 0xffa58f },
+  // Puzzle signage: three-lock door on the Mess side, keyed archive door on the Atrium side
+  { text: 'RESTRICTED — 3 KEYS', code: 'B2-D', tone: 'restricted', width: 2.4, x: -3.5, y: 2.6, z: 23.55, rotY: Math.PI, color: 0xffcf9b },
+  { text: 'ARCHIVE — BOX KEY', code: 'B2-R2', tone: 'restricted', width: 2.4, x: 11, y: 2.6, z: -14, rotY: Math.PI / 2, color: 0xe6e0a8 },
 ];
 
 /** Patrol route through every room, authored as data. Each leg is validated with the navigation graph. */
@@ -353,33 +535,30 @@ export const PATROL_POINTS_XZ: Point2[] = [
   { x: -20, z: -12 }, { x: -8, z: -18 },
 ];
 
-/** Every footprint that blocks walking, for the game's collision, the nav graph and headless tests. */
-export function getSolids(): SolidSpec[] {
-  return [
-    ...WALLS.map((w): SolidSpec => ({ x: w.x, z: w.z, w: w.w, d: w.d, blocksSight: true })),
-    ...PROPS.map((p): SolidSpec => ({ x: p.x, z: p.z, w: p.w, d: p.d, blocksSight: p.blocksSight ?? true })),
-    ...LOCKERS.map((l): SolidSpec => ({ ...lockerSolid(l), blocksSight: true })),
-    ...EXIT_SOLIDS.map((s): SolidSpec => ({ ...s, blocksSight: true })),
-  ];
-}
-
-/** Which crawlspace interior (if any) contains this point. */
-export function crawlspaceAt(x: number, z: number): CrawlspaceSpec | null {
-  for (const c of CRAWLSPACES) {
-    const i = c.interior;
-    if (x >= i.minX && x <= i.maxX && z >= i.minZ && z <= i.maxZ) return c;
-  }
-  return null;
-}
-
 /**
  * CHAPTER_01_LAYOUT — additive only. Packages the existing arrays/functions above (no
  * copies, no new data) into the FacilityLayout shape for future chapter-selection code.
  * Nothing in this file above this point changed, and nothing elsewhere needs to switch to
  * reading this object: every existing import of the named exports above still works
  * exactly as before. See world/FacilityLayout.ts for the interface this satisfies.
+ *
+ * The puzzle fields are intentionally carried here as an additive extension so the object
+ * remains assignable to the current FacilityLayout contract while still exposing the
+ * chapter-specific puzzle data for future consumers.
  */
-export const CHAPTER_01_LAYOUT: FacilityLayout = {
+type Chapter01PuzzleLayout = FacilityLayout & {
+  readonly restrictedRoomId?: string;
+  readonly keycardRoomId?: string;
+  readonly accessDoorPosition?: Point2;
+  readonly drawers?: DrawerSpec[];
+  readonly keys?: KeySpec[];
+  readonly locks?: LockSpec[];
+  readonly fragments?: FragmentSpec[];
+  readonly puzzleObjects?: PuzzleObjectSpec[];
+  readonly keycardRewardPosition?: Point2;
+};
+
+export const CHAPTER_01_LAYOUT: Chapter01PuzzleLayout = {
   id: 'chapter-01',
   worldBounds: WORLD_BOUNDS,
   playerStart: PLAYER_START,
@@ -396,4 +575,14 @@ export const CHAPTER_01_LAYOUT: FacilityLayout = {
   patrolPointsXZ: PATROL_POINTS_XZ,
   getSolids,
   crawlspaceAt,
+  /* puzzle layer */
+  restrictedRoomId: RESTRICTED_ROOM_ID,
+  keycardRoomId: KEYCARD_ROOM_ID,
+  accessDoorPosition: ACCESS_DOOR_POSITION,
+  drawers: PUZZLE_DRAWERS,
+  keys: PUZZLE_KEYS,
+  locks: PUZZLE_LOCKS,
+  fragments: PUZZLE_FRAGMENTS,
+  puzzleObjects: PUZZLE_OBJECTS,
+  keycardRewardPosition: KEYCARD_REWARD_POSITION,
 };
