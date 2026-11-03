@@ -1,0 +1,1741 @@
+
+
+========== src/app/GameApplication.ts ==========
+
+import type { GameServices } from './GameServices';
+import { createServices } from './GameBootstrap';
+import { GameController, type Diagnostics } from './GameController';
+
+/** Lifecycle only: create, start, dispose. Gameplay lives in GameController and the services it drives. */
+export class GameApplication {
+  private services: GameServices | null = null;
+  private controller: GameController | null = null;
+  private readonly container: HTMLElement;
+
+  constructor(container: HTMLElement | null = document.querySelector<HTMLElement>('#app')) {
+    if (!container) throw new Error('GameApplication: #app container not found');
+    this.container = container;
+    try {
+      this.services = createServices(container);
+    } catch (error) {
+      console.error('[GameApplication] startup failed', error);
+      container.textContent = 'Could not start the game: WebGL is unavailable or failed to initialise. Try a current desktop browser with hardware acceleration enabled.';
+      return;
+    }
+    this.controller = new GameController(this.services);
+    this.services.loop.start();
+  }
+
+  get running(): boolean {
+    return this.controller !== null;
+  }
+
+  getDiagnostics(): Diagnostics | null {
+    return this.controller?.getDiagnostics() ?? null;
+  }
+
+  runLifecycleStress(cycles = 20): ReturnType<GameController['runLifecycleStress']> | null {
+    return this.controller?.runLifecycleStress(cycles) ?? null;
+  }
+
+  dispose(): void {
+    this.controller?.dispose();
+    this.services?.disposables.dispose();
+    this.controller = null;
+    this.services = null;
+    if (!this.running) this.container.replaceChildren();
+  }
+}
+
+
+========== src/app/GameBootstrap.ts ==========
+
+
+import { CONFIG } from './GameConfig';
+import type { GameServices } from './GameServices';
+import { EventBus } from '../core/EventBus';
+import { GameStateMachine } from '../core/GameStateMachine';
+import { DisposableStore } from '../core/Disposable';
+import { RendererManager } from '../rendering/RendererManager';
+import { WorldManager } from '../world/WorldManager';
+import { PlayerController } from '../player/PlayerController';
+import { Flashlight } from '../player/Flashlight';
+import { Subject09 } from '../monster/Monster';
+import { GameUI } from '../ui/GameUI';
+import type { SettingsValues } from '../ui/SettingsMenu';
+import { GameLoop } from './GameLoop';
+import { CHAPTER_01_AI } from '../chapters/ChapterAIProfile';
+
+const DEFAULT_SETTINGS: SettingsValues = {
+  mouseSensitivity: 0.0022,
+  masterVolume: 0.8,
+  sfxVolume: 0.8,
+  ambienceVolume: 0.6,
+  quality: 'high',
+  reducedMotion: false,
+};
+
+/** Builds services in dependency order and disposes partial initialization on failure. */
+export function createServices(container: HTMLElement): GameServices {
+  const disposables = new DisposableStore();
+
+  try {
+    const events = new EventBus();
+    disposables.add(() => events.clear());
+
+    const state = new GameStateMachine('menu');
+
+    const renderer = disposables.add(
+      new RendererManager(container),
+    );
+
+    const world = disposables.add(new WorldManager());
+
+    const player = disposables.add(
+      new PlayerController(world, events, renderer.canvas),
+    );
+
+    renderer.attachCamera(player.camera);
+
+    const flashlight = disposables.add(
+      new Flashlight(world.scene),
+    );
+
+    const monster = disposables.add(
+      new Subject09(world, player, events),
+    );
+    monster.setChapterProfile(CHAPTER_01_AI);
+
+    const ui = disposables.add(
+      new GameUI(
+        {
+          onNewGame: () => state.transition('playing'),
+          onResume: () => state.transition('playing'),
+          onRestart: () => state.transition('playing'),
+          onMainMenu: () => state.transition('menu'),
+          onSettingsChange: () => undefined,
+          onPauseRequest: () => state.transition('paused'),
+        },
+        DEFAULT_SETTINGS,
+        'Chapter 1 complete.',
+      ),
+    );
+
+    const loop = disposables.add(new GameLoop(CONFIG.loop));
+
+    return {
+      config: CONFIG,
+      events,
+      state,
+      renderer,
+      world,
+      player,
+      flashlight,
+      monster,
+      ui,
+      loop,
+      disposables,
+    };
+  } catch (error) {
+    disposables.dispose();
+    throw error;
+  }
+}
+
+
+========== src/app/GameController.ts ==========
+
+import type { GameServices } from './GameServices';
+import type { GameMode } from '../core/types';
+import { DisposableStore, getLiveDomListeners, type Disposable } from '../core/Disposable';
+import { RestartSystem } from '../gameplay/RestartSystem';
+import { getInteractionPrompt, getObjective } from '../gameplay/ObjectiveSystem';
+import { crawlspaceAt } from '../world/LevelLayout';
+import { SaveManager, createNewSave, type SaveData } from '../save/SaveManager';
+import { CHAPTER_01_CAMPAIGN } from '../chapters/Chapter01_Containment';
+import { getNextChapter } from '../chapters/CampaignIndex';
+
+export interface Diagnostics {
+  mode: GameMode;
+  canvases: number;
+  overlays: number;
+  huds: number;
+  domListeners: number;
+  busListeners: number;
+  stateListeners: number;
+  sceneObjects: number;
+}
+
+/** Game flow: mode changes, input routing (temporary until the Stage D InputManager), per-frame update and HUD. */
+export class GameController implements Disposable {
+  private readonly disposables = new DisposableStore();
+  private readonly restart: RestartSystem;
+  private toastTimer = 0;
+  private crawlHinted = false;
+  private objective = getObjective(false);
+  private readonly saves = new SaveManager();
+  private save: SaveData | null = null;
+
+  constructor(private readonly s: GameServices) {
+    this.restart = new RestartSystem(s);
+    s.ui.bind({
+      newGame: () => this.startGame(),
+      showHowTo: () => this.s.state.transition('howto'),
+      showMenu: () => this.returnToMenu(),
+      resume: () => this.s.state.transition('playing'),
+      restart: () => this.startGame(),
+    });
+    this.disposables.add(s.state.onChange((to, from) => this.enter(to, from)));
+    this.disposables.add(s.events.on('message', (m) => this.toast(m)));
+    this.disposables.add(s.events.on('caught', () => s.state.transition('caught')));
+    this.disposables.add(s.events.on('complete', () => {
+      if (this.save) {
+        const next = getNextChapter(CHAPTER_01_CAMPAIGN.id);
+        this.save = this.saves.markChapterCompleted(this.save, CHAPTER_01_CAMPAIGN.id, next?.id ?? null);
+        this.saves.save(this.save);
+      }
+      s.state.transition('complete');
+    }));
+    this.disposables.addListener(window, 'keydown', this.onKeyDown as EventListener);
+    this.disposables.addListener(document, 'visibilitychange', () => {
+      if (document.hidden && s.state.is('playing')) s.state.transition('paused');
+    });
+    s.renderer.onContextLost = () => {
+      if (s.state.is('playing')) s.state.transition('paused');
+    };
+    s.loop.onStep = this.step;
+    s.loop.onRender = this.frame;
+    s.ui.showMenu();
+  }
+
+  private enter(to: GameMode, from: GameMode): void {
+    document.exitPointerLock?.();
+    this.s.loop.paused = to !== 'playing';
+    this.s.events.emit('modechange', { from, to });
+    switch (to) {
+      case 'menu': this.s.ui.showMenu(); break;
+      case 'howto': this.s.ui.showHowTo(); break;
+      case 'playing': this.s.ui.showHud(); this.toast(''); break;
+      case 'paused': this.s.ui.showPause(); break;
+      case 'caught': this.s.ui.showCaught(); break;
+      case 'complete': this.s.ui.showComplete(); break;
+    }
+  }
+
+  /** Starts a brand-new run: fresh seed, keycard relocated. */
+  startGame(): void {
+    const seed = (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0;
+    this.save = createNewSave(CHAPTER_01_CAMPAIGN.id, seed);
+    this.saves.save(this.save);
+    this.beginChapter(seed);
+  }
+
+  /** Continues the last save: same seed, so the keycard stays exactly where it was. */
+  continueGame(): void {
+    const loaded = this.saves.load();
+    if (!loaded) { this.startGame(); return; }
+    this.save = loaded;
+    this.beginChapter(loaded.runSeed);
+  }
+
+  private beginChapter(seed: number): void {
+    this.restart.reset();
+    this.s.world.placeKeycardForSeed(seed);
+    this.objective = getObjective(false);
+    this.crawlHinted = false;
+    if (!this.s.state.transition('playing')) this.enter('playing', 'playing');
+    this.toast('CONTAINMENT BREACH: Find a way out. Search the facility and stay quiet.');
+  }
+
+  returnToMenu(): void {
+    this.s.state.transition('menu');
+  }
+
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (e.repeat) return;
+    const k = e.key.toLowerCase();
+    const { state, player, flashlight } = this.s;
+    if (k === 'escape') {
+      if (state.is('playing')) state.transition('paused');
+      else if (state.is('paused')) state.transition('playing');
+      return;
+    }
+    if (!state.is('playing')) return;
+    if (k === 'e') player.interact();
+    if (k === 'g') player.throwDistraction();
+    if (k === 'f') player.toggleFlashlight(flashlight.light);
+  };
+
+  private toast(text: string): void {
+    this.s.ui.toast(text);
+    this.toastTimer = text ? this.s.config.ui.toastSeconds : 0;
+  }
+
+  private step = (dt: number, time: number): void => {
+    if (!this.s.state.is('playing')) return;
+    const { player, monster, flashlight } = this.s;
+    player.update(dt, time, false);
+    flashlight.follow(player.camera);
+    if (!this.crawlHinted && crawlspaceAt(player.position.x, player.position.z)) {
+      this.crawlHinted = true;
+      this.toast('SAFE CLOSET: Subject 09 is too big to follow you in here. Stand in a corner, out of its line of sight.');
+    }
+    monster.update(dt, time);
+    if (this.toastTimer > 0) {
+      this.toastTimer -= dt;
+      if (this.toastTimer <= 0) this.toast('');
+    }
+    this.objective = getObjective(player.hasKeycard);
+  };
+
+  private frame = (): void => {
+    const { state, ui, player, monster, world, renderer } = this.s;
+    if (state.is('playing')) {
+      ui.updateHud({
+        objective: this.objective,
+        hasKeycard: player.hasKeycard,
+        monsterDistance: player.position.distanceTo(monster.root.position),
+        hidden: player.hidden,
+        sprinting: player.sprinting,
+        crouching: player.crouching,
+        prompt: getInteractionPrompt(player, world),
+      });
+    }
+    renderer.render(world.scene);
+  };
+
+  getDiagnostics(): Diagnostics {
+    return {
+      mode: this.s.state.mode,
+      canvases: document.querySelectorAll('canvas').length,
+      overlays: document.querySelectorAll('#overlay').length,
+      huds: document.querySelectorAll('#hud').length,
+      domListeners: getLiveDomListeners(),
+      busListeners: this.s.events.listenerCount(),
+      stateListeners: this.s.state.listenerCount(),
+      sceneObjects: this.s.world.scene.children.length,
+    };
+  }
+
+  /** Browser-only lifecycle check: start -> menu -> start, repeated. Counts must not grow. */
+  runLifecycleStress(cycles = 20): { before: Diagnostics; after: Diagnostics; stable: boolean } {
+    this.returnToMenu();
+    const before = this.getDiagnostics();
+    for (let i = 0; i < cycles; i++) {
+      this.startGame();
+      this.s.state.transition('paused');
+      this.startGame();
+      this.returnToMenu();
+    }
+    const after = this.getDiagnostics();
+    const stable = (Object.keys(before) as Array<keyof Diagnostics>).every((k) => before[k] === after[k]);
+    return { before, after, stable };
+  }
+
+  dispose(): void {
+    this.s.loop.onStep = () => undefined;
+    this.s.loop.onRender = () => undefined;
+    this.s.renderer.onContextLost = null;
+    this.disposables.dispose();
+  }
+}
+
+
+========== src/app/GameServices.ts ==========
+
+import type { EventBus } from '../core/EventBus';
+import type { GameStateMachine } from '../core/GameStateMachine';
+import type { DisposableStore } from '../core/Disposable';
+import type { RendererManager } from '../rendering/RendererManager';
+import type { WorldManager } from '../world/WorldManager';
+import type { PlayerController } from '../player/PlayerController';
+import type { Flashlight } from '../player/Flashlight';
+import type { Subject09 } from '../monster/Monster';
+import type { GameUI } from '../ui/GameUI';
+import type { GameLoop } from './GameLoop';
+import type { GameConfig } from './GameConfig';
+
+/** Typed container: every shared system has exactly one owner and is created once in GameBootstrap. */
+export interface GameServices {
+  readonly config: GameConfig;
+  readonly events: EventBus;
+  readonly state: GameStateMachine;
+  readonly renderer: RendererManager;
+  readonly world: WorldManager;
+  readonly player: PlayerController;
+  readonly flashlight: Flashlight;
+  readonly monster: Subject09;
+  readonly ui: GameUI;
+  readonly loop: GameLoop;
+  /** Owns disposal of everything above, in reverse creation order. */
+  readonly disposables: DisposableStore;
+}
+
+
+========== src/app/GameLoop.ts ==========
+
+import { DisposableStore, type Disposable } from '../core/Disposable';
+import { CONFIG } from './GameConfig';
+
+export interface LoopTuning { maxStep: number; maxFrameTime: number }
+
+/**
+ * One requestAnimationFrame loop for the whole game.
+ * - A frame longer than maxFrameTime is clamped (no huge jump after a tab switch).
+ * - The frame is split into equal sub-steps of at most maxStep, so collision and AI never see a big dt.
+ * - Any refresh rate (60/144 Hz) gets smooth movement because the last sub-step uses the real remainder.
+ * - While `paused`, nothing is simulated but rendering continues.
+ */
+export class GameLoop implements Disposable {
+  paused = true;
+  onStep: (dt: number, time: number) => void = () => undefined;
+  onRender: () => void = () => undefined;
+  private running = false;
+  private raf = 0;
+  private last = 0;
+  private time = 0;
+  private readonly disposables = new DisposableStore();
+
+  constructor(private readonly tuning: LoopTuning = CONFIG.loop) {
+    this.disposables.addListener(document, 'visibilitychange', () => {
+      this.last = performance.now();
+    });
+  }
+
+  get simulationTime(): number {
+    return this.time;
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.last = performance.now();
+    this.raf = requestAnimationFrame(this.frame);
+  }
+
+  stop(): void {
+    this.running = false;
+    cancelAnimationFrame(this.raf);
+  }
+
+  private frame = (now: number): void => {
+    if (!this.running) return;
+    this.raf = requestAnimationFrame(this.frame);
+    const frameDt = Math.min(Math.max((now - this.last) / 1000, 0), this.tuning.maxFrameTime);
+    this.last = now;
+    if (!this.paused && frameDt > 0) {
+      const steps = Math.max(1, Math.ceil(frameDt / this.tuning.maxStep));
+      const dt = frameDt / steps;
+      for (let i = 0; i < steps && !this.paused; i++) {
+        this.time += dt;
+        this.onStep(dt, this.time);
+      }
+    }
+    this.onRender();
+  };
+
+  dispose(): void {
+    this.stop();
+    this.disposables.dispose();
+  }
+}
+
+
+========== src/monster/Monster.ts ==========
+
+import * as THREE from 'three';
+import { LOCKERS, PATROL_POINTS_XZ, getSolids, type Point2 } from '../world/LevelLayout';
+import { NavigationGraph, segmentBlocked } from '../world/NavigationGraph';
+import { MonsterNavigation } from './MonsterNavigation';
+import { MonsterMemory } from './MonsterMemory';
+import { Subject09Model } from './MonsterModel';
+import type { MonsterState, SoundEvent } from '../core/types';
+import { EventBus } from '../core/EventBus';
+import { DisposableStore } from '../core/Disposable';
+import { Random } from '../core/Random';
+import { WorldManager } from '../world/WorldManager';
+import { PlayerController } from '../player/PlayerController';
+import { CONFIG } from '../app/GameConfig';
+import { CHAPTER_01_AI, type ChapterAIProfile } from '../chapters/ChapterAIProfile';
+
+const SOLIDS = getSolids();
+
+/**
+ * Subject 09's brain. It only ever knows what it can see (range, FOV, unobstructed line of sight) or hear (sound
+ * events with wall muffling), walks real A* paths, and can never enter the 0.88 m crawlspaces. Adaptation is a few
+ * capped, decaying counters in MonsterMemory plus a seeded RNG, so behaviour is deterministic and explainable.
+ */
+export class Subject09 {
+  readonly root: THREE.Group;
+  state: MonsterState = 'PATROL';
+  private readonly model = new Subject09Model();
+  private readonly graph = new NavigationGraph(CONFIG.monster.collisionRadius, SOLIDS);
+  private readonly nav = new MonsterNavigation(this.graph, PATROL_POINTS_XZ[0]);
+  private readonly memory = new MonsterMemory();
+  private readonly rng = new Random(CONFIG.monster.seed);
+  private readonly disposables = new DisposableStore();
+  private patrolIndex = 1;
+  private pause = 0;
+  private stateTimer = 0;
+  private sightLostFor = 0;
+  private blockedFor = 0;
+  private cautious = false;
+  private yaw = 0;
+  private desiredYaw = 0;
+  private smoothSpeed = 0;
+  private lastKnown: Point2 = { x: 0, z: 0 };
+  private searchPoints: Point2[] = [];
+  private searchIndex = 0;
+  private searchWait = 0;
+  private lockerQueue: number[] = [];
+  private lockerAnnounced = false;
+  private inspecting = 0;
+  private chapterProfile: ChapterAIProfile = CHAPTER_01_AI;
+
+  constructor(
+    private readonly world: WorldManager,
+    private readonly player: PlayerController,
+    private readonly events: EventBus,
+  ) {
+    this.root = this.model.root;
+    this.world.scene.add(this.root);
+    this.reset();
+    this.disposables.add(this.events.on('sound', (s) => this.onSound(s)));
+  }
+
+  /** What the HUD may show: distance only, never the monster's knowledge. */
+  get position(): THREE.Vector3 { return this.root.position; }
+
+  reset(): void {
+    this.state = 'PATROL';
+    this.nav.place(PATROL_POINTS_XZ[0].x, PATROL_POINTS_XZ[0].z);
+    this.memory.reset();
+    this.rng.reseed(CONFIG.monster.seed);
+    this.patrolIndex = 1;
+    this.pause = 1.5;
+    this.stateTimer = 0;
+    this.sightLostFor = 0;
+    this.blockedFor = 0;
+    this.cautious = false;
+    this.yaw = 0;
+    this.desiredYaw = 0;
+    this.smoothSpeed = 0;
+    this.searchPoints = [];
+    this.searchIndex = 0;
+    this.searchWait = 0;
+    this.lockerQueue = [];
+    this.lockerAnnounced = false;
+    this.inspecting = 0;
+    this.lastKnown = { x: this.nav.x, z: this.nav.z };
+    this.syncRoot();
+  }
+
+  /** Switches Subject 09's abilities when the campaign advances to another chapter. */
+  setChapterProfile(profile: ChapterAIProfile): void {
+    this.chapterProfile = profile;
+    this.memory.reset();
+    this.setState('PATROL');
+  }
+
+  // ---- Hearing --------------------------------------------------------------------------------------------------
+  private onSound(s: SoundEvent): void {
+    if (!this.chapterProfile.investigateSounds) return;
+    const M = CONFIG.monster;
+    const dx = s.position.x - this.nav.x;
+    const dz = s.position.z - this.nav.z;
+    const distance = Math.hypot(dx, dz);
+    const open = !segmentBlocked(this.nav.x, this.nav.z, s.position.x, s.position.z, SOLIDS);
+    const effective = open ? distance : distance * M.muffleFactor;
+    if (effective > s.loudness * M.soundRangeMultiplier * this.chapterProfile.hearingRangeMultiplier) return;
+    if (this.state === 'CHASE') return;
+    if (s.kind === 'throw') {
+      if (this.chapterProfile.adaptiveMemory) this.memory.recordThrow();
+      this.cautious = !this.rng.chance(this.memory.throwEffectiveness());
+    } else {
+      this.cautious = false;
+    }
+    this.desiredYaw = Math.atan2(-dx, -dz);
+    this.investigate({ x: s.position.x, z: s.position.z });
+  }
+
+  private investigate(at: Point2): void {
+    this.lastKnown = at;
+    this.nav.setGoal(at, true);
+    this.pause = 0;
+    this.setState('INVESTIGATE');
+  }
+
+  // ---- State helpers --------------------------------------------------------------------------------------------
+  private setState(s: MonsterState): void {
+    if (this.state === s) return;
+    this.state = s;
+    this.stateTimer = 0;
+    this.events.emit('message', this.stateMessage(s));
+  }
+
+  private stateMessage(s: MonsterState): string {
+    const messages: Record<MonsterState, string> = {
+      PATROL: 'You hear slow footsteps somewhere nearby.',
+      INVESTIGATE: 'Subject 09 heard something.',
+      SEARCH: 'Subject 09 is searching the area.',
+      CHASE: 'RUN. Subject 09 has spotted you.',
+      RETURN: 'Subject 09 is moving away.',
+    };
+    return messages[s];
+  }
+
+  private beginSearch(): void {
+    const M = CONFIG.monster;
+    const radius = this.chapterProfile.adaptiveMemory && this.memory.lockerUses > 1 ? M.searchRadiusAfterHiding : M.searchRadius;
+    this.searchPoints = [{ ...this.lastKnown }];
+    for (let i = 0; i < 3; i++) {
+      const angle = this.rng.range(0, Math.PI * 2);
+      const r = this.rng.range(1.2, radius);
+      const snapped = this.graph.nearestWalkable(this.lastKnown.x + Math.cos(angle) * r, this.lastKnown.z + Math.sin(angle) * r, 2);
+      if (snapped) this.searchPoints.push(snapped);
+    }
+    this.searchIndex = 0;
+    this.searchWait = 0;
+    const count = this.chapterProfile.searchHidingSpots
+      ? Math.max(this.chapterProfile.adaptiveMemory ? this.memory.lockersToCheck() : 1, this.cautious ? 1 : 0)
+      : 0;
+    this.lockerQueue = LOCKERS
+      .map((l, i) => ({ i, d: Math.hypot(l.x - this.lastKnown.x, l.z - this.lastKnown.z) }))
+      .filter((e) => e.d <= M.lockerSearchRange)
+      .sort((a, b) => a.d - b.d)
+      .slice(0, count)
+      .map((e) => e.i);
+    this.lockerAnnounced = false;
+    this.inspecting = 0;
+    this.nav.setGoal(this.searchPoints[0], true);
+    this.setState('SEARCH');
+  }
+
+  private beginReturn(): void {
+    let best = this.patrolIndex;
+    let bestD = Infinity;
+    PATROL_POINTS_XZ.forEach((p, i) => {
+      const d = Math.hypot(p.x - this.nav.x, p.z - this.nav.z);
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    this.patrolIndex = best;
+    this.cautious = false;
+    this.nav.setGoal(PATROL_POINTS_XZ[best], true);
+    this.setState('RETURN');
+  }
+
+  // ---- Update ---------------------------------------------------------------------------------------------------
+  update(dt: number, time: number): void {
+    const M = CONFIG.monster;
+    this.stateTimer += dt;
+    this.memory.decay(dt);
+    const p = this.player.position;
+    const dx = p.x - this.nav.x;
+    const dz = p.z - this.nav.z;
+    const dist = Math.hypot(dx, dz);
+    const los = dist < 30 && !segmentBlocked(this.nav.x, this.nav.z, p.x, p.z, SOLIDS);
+    const facing = dist > 1e-6 ? (-Math.sin(this.yaw) * dx + -Math.cos(this.yaw) * dz) / dist : 1;
+    const visible = !this.player.hidden && los;
+    const flashlightBonus = this.chapterProfile.detectFlashlight && this.player.flashlightOn
+      ? this.chapterProfile.flashlightSightBonus : 0;
+    const effectiveSightRange = M.sightRange * this.chapterProfile.sightRangeMultiplier + flashlightBonus;
+    const spotted = visible && ((dist < effectiveSightRange && facing > M.sightFacingMin) || dist < M.closeDetectRange);
+
+    if (spotted) {
+      this.lastKnown = { x: p.x, z: p.z };
+      this.sightLostFor = 0;
+      this.blockedFor = 0;
+      this.inspecting = 0;
+      this.cautious = false;
+      this.setState('CHASE');
+    }
+
+    let speed: number = M.speeds.patrol;
+    switch (this.state) {
+      case 'PATROL': {
+        speed = M.speeds.patrol * this.chapterProfile.patrolSpeedMultiplier;
+        if (this.pause > 0) { this.pause -= dt; break; }
+        if (!this.nav.hasGoal) {
+          if (!this.nav.setGoal(PATROL_POINTS_XZ[this.patrolIndex]).ok) this.patrolIndex = (this.patrolIndex + 1) % PATROL_POINTS_XZ.length;
+        } else if (this.nav.arrived) {
+          this.pause = M.patrolPauseSeconds;
+          this.patrolIndex = (this.patrolIndex + 1) % PATROL_POINTS_XZ.length;
+          this.nav.clearGoal();
+        }
+        break;
+      }
+      case 'INVESTIGATE': {
+        speed = M.speeds.investigate * this.chapterProfile.investigateSpeedMultiplier * (this.cautious ? M.cautiousSpeedFactor : 1);
+        if (this.nav.arrived) this.beginSearch();
+        else if (this.stateTimer > M.investigateTimeout) this.beginReturn();
+        break;
+      }
+      case 'SEARCH': {
+        speed = M.speeds.search * this.chapterProfile.searchSpeedMultiplier * (this.cautious ? M.cautiousSpeedFactor : 1);
+        this.updateSearch(dt);
+        break;
+      }
+      case 'CHASE': {
+        speed = M.speeds.chase * this.chapterProfile.chaseSpeedMultiplier * (visible && dist < M.lungeRange ? M.lungeSpeedFactor : 1);
+        this.updateChase(dt, p, visible, dist, los);
+        break;
+      }
+      case 'RETURN': {
+        speed = M.speeds.return * this.chapterProfile.patrolSpeedMultiplier;
+        if (this.nav.arrived || this.stateTimer > M.returnTimeout) {
+          this.nav.clearGoal();
+          this.pause = 0.6;
+          this.setState('PATROL');
+        }
+        break;
+      }
+    }
+
+    const moved = this.inspecting > 0 || this.pause > 0 ? 0 : this.nav.update(dt, speed);
+    if (moved > 0) this.desiredYaw = this.nav.heading;
+    this.smoothSpeed += (moved / Math.max(dt, 1e-4) - this.smoothSpeed) * (1 - Math.exp(-dt * 8));
+    let diff = this.desiredYaw - this.yaw;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    this.yaw += diff * (1 - Math.exp(-dt * M.turnRate));
+    this.syncRoot();
+    this.model.update(dt, time, this.state, this.smoothSpeed, this.state !== 'PATROL');
+  }
+
+  private updateChase(dt: number, p: THREE.Vector3, visible: boolean, dist: number, los: boolean): void {
+    const M = CONFIG.monster;
+    if (this.player.hidden) {
+      // Later chapters let Subject 09 inspect hiding places and remember repeated use.
+      if (this.chapterProfile.searchHidingSpots && this.chapterProfile.adaptiveMemory) this.memory.recordLockerUse();
+      this.lastKnown = { x: p.x, z: p.z };
+      this.beginSearch();
+      return;
+    }
+    if (visible) {
+      this.sightLostFor = 0;
+      this.lastKnown = { x: p.x, z: p.z };
+    } else {
+      this.sightLostFor += dt;
+    }
+    if (this.sightLostFor > M.chaseLostSightSeconds && this.nav.arrived) {
+      this.beginSearch();
+      return;
+    }
+    const goal = this.nav.setGoal(this.lastKnown, true);
+    if (this.nav.arrived && visible && dist > 1.6) {
+      // Standing at the nearest reachable spot while the player is somewhere it cannot enter (crawlspace).
+      this.blockedFor += dt;
+      this.desiredYaw = Math.atan2(-(p.x - this.nav.x), -(p.z - this.nav.z));
+      if (this.blockedFor > M.chaseBlockedSeconds) {
+        this.events.emit('message', 'Subject 09 cannot fit through there. It is waiting.');
+        this.blockedFor = 0;
+        this.beginSearch();
+        return;
+      }
+    } else if (goal.ok) {
+      this.blockedFor = 0;
+    }
+    if (dist < M.catchDistance && los) this.events.emit('caught', undefined);
+  }
+
+  private updateSearch(dt: number): void {
+    const M = CONFIG.monster;
+    if (this.stateTimer > M.searchTimeout + this.chapterProfile.extraSearchSeconds) { this.beginReturn(); return; }
+    if (this.inspecting > 0) {
+      this.inspecting -= dt;
+      if (this.inspecting <= 0) this.finishInspection();
+      return;
+    }
+    if (!this.nav.arrived) return;
+    if (this.searchWait > 0) { this.searchWait -= dt; return; }
+    if (this.searchIndex < this.searchPoints.length) {
+      this.searchIndex++;
+      this.searchWait = M.searchPointWaitSeconds;
+      const next = this.searchPoints[this.searchIndex];
+      if (next) this.nav.setGoal(next, true);
+      return;
+    }
+    const lockerIndex = this.lockerQueue[0];
+    if (lockerIndex === undefined) { this.beginReturn(); return; }
+    const locker = LOCKERS[lockerIndex];
+    if (!this.lockerAnnounced) {
+      this.lockerAnnounced = true;
+      this.events.emit('message', 'Subject 09 is checking the lockers. Move if you can.');
+    }
+    if (Math.hypot(locker.x - this.nav.x, locker.z - this.nav.z) <= M.lockerReachDistance) {
+      this.inspecting = M.lockerInspectSeconds;
+      this.desiredYaw = Math.atan2(-(locker.x - this.nav.x), -(locker.z - this.nav.z));
+    } else if (!this.nav.setGoal(locker, true).ok) {
+      this.lockerQueue.shift();
+    }
+  }
+
+  private finishInspection(): void {
+    const lockerIndex = this.lockerQueue.shift();
+    if (lockerIndex === undefined) return;
+    const occupied = this.player.hidden && this.player.currentHidingIndex === lockerIndex;
+    const discoveryChance = this.chapterProfile.adaptiveMemory ? this.memory.lockerDiscoveryChance() : 0.3;
+    if (occupied && this.rng.chance(discoveryChance)) {
+      this.lastKnown = { x: this.player.position.x, z: this.player.position.z };
+      this.player.ejectFromHiding();
+      this.events.emit('message', 'The locker door is torn open!');
+      this.sightLostFor = 0;
+      this.setState('CHASE');
+    } else if (occupied) {
+      this.events.emit('message', 'It rattled your locker… and moved on. Stay still.');
+    }
+  }
+
+  private syncRoot(): void {
+    this.root.position.set(this.nav.x, 0, this.nav.z);
+    this.root.rotation.y = this.yaw;
+  }
+
+  dispose(): void {
+    this.disposables.dispose();
+    this.world.scene.remove(this.root);
+    this.model.dispose();
+  }
+}
+
+
+========== src/player/PlayerController.ts ==========
+
+import * as THREE from 'three';
+import { WorldManager } from '../world/WorldManager';
+import { EventBus } from '../core/EventBus';
+import { DisposableStore } from '../core/Disposable';
+import { CONFIG } from '../app/GameConfig';
+import { PLAYER_START, WORLD_BOUNDS } from '../world/LevelLayout';
+
+interface Orb { mesh: THREE.Mesh; timer: number }
+
+export class PlayerController {
+  readonly position = new THREE.Vector3(PLAYER_START.x, 0, PLAYER_START.z);
+  readonly camera = new THREE.PerspectiveCamera(CONFIG.player.fov, window.innerWidth / window.innerHeight, CONFIG.player.near, CONFIG.player.far);
+  readonly keys = new Set<string>();
+  yaw: number = PLAYER_START.yaw;
+  pitch = 0;
+  crouching = false;
+  sprinting = false;
+  hidden = false;
+  currentHidingIndex = -1;
+  hasKeycard = false;
+  flashlightOn = true;
+  private lastFootstep = -999;
+  private bobTime = 0;
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly orbs = new Set<Orb>();
+  private readonly disposables = new DisposableStore();
+
+  constructor(
+    private readonly world: WorldManager,
+    private readonly events: EventBus,
+    private readonly canvas: HTMLCanvasElement,
+  ) {
+    this.camera.position.set(this.position.x, 1.68, this.position.z);
+    this.camera.rotation.order = 'YXZ';
+    this.disposables.addListener(window, 'keydown', this.keyDown as EventListener);
+    this.disposables.addListener(window, 'keyup', this.keyUp as EventListener);
+    this.disposables.addListener(window, 'mousemove', this.mouseMove as EventListener);
+    this.disposables.addListener(canvas, 'click', this.requestLock);
+  }
+
+  private say(message: string): void {
+    this.events.emit('message', message);
+  }
+
+  private keyDown = (e: KeyboardEvent): void => {
+    const k = e.key.toLowerCase();
+    this.keys.add(k);
+    if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+  };
+  private keyUp = (e: KeyboardEvent): void => { this.keys.delete(e.key.toLowerCase()); };
+  private mouseMove = (e: MouseEvent): void => {
+    if (document.pointerLockElement !== this.canvas) return;
+    this.yaw -= e.movementX * CONFIG.player.lookSensitivityYaw;
+    this.pitch -= e.movementY * CONFIG.player.lookSensitivityPitch;
+    this.pitch = THREE.MathUtils.clamp(this.pitch, -CONFIG.player.pitchLimit, CONFIG.player.pitchLimit);
+  };
+  private requestLock = (): void => {
+    if (!this.hidden && !document.pointerLockElement) this.canvas.requestPointerLock?.();
+  };
+
+  /** Back to the chapter start: position, view, inventory, hiding state, held keys and any thrown orbs. */
+  reset(): void {
+    this.position.set(PLAYER_START.x, 0, PLAYER_START.z);
+    this.yaw = PLAYER_START.yaw;
+    this.pitch = 0;
+    this.hidden = false;
+    this.currentHidingIndex = -1;
+    this.hasKeycard = false;
+    this.crouching = false;
+    this.sprinting = false;
+    this.flashlightOn = true;
+    this.lastFootstep = -999;
+    this.bobTime = 0;
+    this.keys.clear();
+    this.clearOrbs();
+    this.camera.position.set(this.position.x, 1.68, this.position.z);
+    this.camera.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+  }
+
+  update(dt: number, time: number, paused: boolean): void {
+    if (paused) return;
+    const P = CONFIG.player;
+    this.sprinting = this.keys.has('shift') && !this.crouching && !this.hidden;
+    this.crouching = this.keys.has('control') || this.keys.has('c');
+    if (!this.hidden) {
+      const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+      const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
+      const move = new THREE.Vector3();
+      if (this.keys.has('w')) move.add(forward);
+      if (this.keys.has('s')) move.sub(forward);
+      if (this.keys.has('d')) move.add(right);
+      if (this.keys.has('a')) move.sub(right);
+      const moving = move.lengthSq() > 0;
+      if (moving) {
+        move.normalize();
+        const speed = this.sprinting ? P.sprintSpeed : this.crouching ? P.crouchSpeed : P.walkSpeed;
+        const next = this.position.clone().addScaledVector(move, speed * dt);
+        const tryX = this.position.clone();
+        tryX.x = next.x;
+        if (!this.world.isBlocked(tryX)) this.position.x = next.x;
+        const tryZ = this.position.clone();
+        tryZ.z = next.z;
+        if (!this.world.isBlocked(tryZ)) this.position.z = next.z;
+        this.bobTime += dt * (this.sprinting ? P.bobSpeedSprint : P.bobSpeedWalk);
+        const interval = this.sprinting ? P.footstepInterval.sprint : this.crouching ? P.footstepInterval.crouch : P.footstepInterval.walk;
+        if (time - this.lastFootstep > interval) {
+          this.lastFootstep = time;
+          this.events.emit('sound', { position: this.position.clone(), loudness: this.getNoiseLevel(), kind: 'footstep', time });
+        }
+      }
+      this.camera.position.set(
+        this.position.x,
+        (this.crouching ? P.crouchEyeHeight : P.eyeHeight) + (moving ? Math.sin(this.bobTime) * P.bobAmplitude : 0),
+        this.position.z,
+      );
+    } else if (this.currentHidingIndex >= 0) {
+      const p = this.world.hidingSpots[this.currentHidingIndex].position;
+      this.camera.position.set(p.x, P.hidingEyeHeight, p.z);
+    }
+    this.camera.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+  }
+
+  interact(): void {
+    const R = CONFIG.player.interact;
+    if (this.hidden) {
+      const spot = this.world.hidingSpots[this.currentHidingIndex];
+      if (spot) spot.occupied = false;
+      this.hidden = false;
+      this.currentHidingIndex = -1;
+      this.say('You leave the hiding place.');
+      document.exitPointerLock?.();
+      return;
+    }
+    const origin = this.camera.position.clone();
+    const direction = new THREE.Vector3();
+    this.camera.getWorldDirection(direction);
+    this.raycaster.set(origin, direction);
+    this.raycaster.far = R.rayRange;
+    const hits = this.raycaster.intersectObjects(this.world.scene.children, true);
+    const hit = hits.find((h) => h.object.userData.exit || this.world.interactables.some((i) => i.mesh === h.object || i.mesh === h.object.parent));
+    const nearby = this.world.interactables
+      .filter((i) => i.active && i.position.distanceTo(this.position) < R.nearbyRange)
+      .sort((a, b) => a.position.distanceTo(this.position) - b.position.distanceTo(this.position))[0];
+    if (nearby && (hit || nearby.position.distanceTo(this.position) < R.closeRange)) {
+      if (nearby.kind === 'keycard') {
+        this.hasKeycard = true;
+        nearby.active = false;
+        nearby.mesh.visible = false;
+        this.say('Security keycard acquired. The exit can now be unlocked.');
+        this.events.emit('sound', { position: this.position.clone(), loudness: 3, kind: 'door', time: performance.now() / 1000 });
+        return;
+      }
+      if (nearby.kind === 'note') {
+        nearby.active = false;
+        nearby.mesh.visible = false;
+        this.say(nearby.text ?? 'You read the note.');
+        return;
+      }
+      if (nearby.kind === 'hiding') {
+        const spot = this.world.hidingSpots.findIndex((s) => s.mesh === nearby.mesh);
+        if (spot >= 0) {
+          this.hidden = true;
+          this.currentHidingIndex = spot;
+          nearby.active = true;
+          this.world.hidingSpots[spot].occupied = true;
+          this.say('You are hidden. Stay quiet; press E to leave.');
+          document.exitPointerLock?.();
+        }
+        return;
+      }
+    }
+    if (this.position.distanceTo(this.world.exitPosition) < R.exitRange) {
+      if (this.hasKeycard) this.events.emit('complete', undefined);
+      else this.say('Access denied. A security keycard is required.');
+      return;
+    }
+    this.say('Nothing to interact with here.');
+  }
+
+  /** Used by Subject 09 when it tears an occupied locker open. */
+  ejectFromHiding(): void {
+    if (!this.hidden) return;
+    const spot = this.world.hidingSpots[this.currentHidingIndex];
+    if (spot) spot.occupied = false;
+    this.hidden = false;
+    this.currentHidingIndex = -1;
+  }
+
+  throwDistraction(): void {
+    const T = CONFIG.player.throwDistraction;
+    if (this.hidden) {
+      this.say('You cannot throw a distraction while hidden.');
+      return;
+    }
+    const direction = new THREE.Vector3();
+    this.camera.getWorldDirection(direction);
+    direction.y = 0;
+    if (direction.lengthSq() < 1e-6) direction.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+    direction.normalize();
+    // Pull the landing spot back until it is in open floor, so a throw never lands inside a wall or another room.
+    const pos = this.position.clone();
+    for (let d = T.distance; d >= 0.5; d -= 0.25) {
+      const candidate = this.position.clone().addScaledVector(direction, d);
+      if (!this.world.isBlocked(candidate, 0.12)) { pos.copy(candidate); break; }
+    }
+    pos.y = 0;
+    pos.x = THREE.MathUtils.clamp(pos.x, WORLD_BOUNDS.minX + T.clampMargin, WORLD_BOUNDS.maxX - T.clampMargin);
+    pos.z = THREE.MathUtils.clamp(pos.z, WORLD_BOUNDS.minZ + T.clampMargin, WORLD_BOUNDS.maxZ - T.clampMargin);
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.11, 10, 8),
+      new THREE.MeshStandardMaterial({ color: 0xc8a26b, emissive: 0x6c3e15 }),
+    );
+    mesh.position.set(pos.x, 0.2, pos.z);
+    this.world.scene.add(mesh);
+    const orb: Orb = { mesh, timer: 0 };
+    orb.timer = window.setTimeout(() => this.removeOrb(orb), T.orbLifetimeMs);
+    this.orbs.add(orb);
+    this.events.emit('sound', { position: pos, loudness: T.loudness, kind: 'throw', time: performance.now() / 1000 });
+    this.say('Object thrown. Subject 09 may investigate the impact.');
+  }
+
+  private removeOrb(orb: Orb): void {
+    window.clearTimeout(orb.timer);
+    this.orbs.delete(orb);
+    this.world.scene.remove(orb.mesh);
+    orb.mesh.geometry.dispose();
+    (orb.mesh.material as THREE.Material).dispose();
+  }
+
+  private clearOrbs(): void {
+    for (const orb of [...this.orbs]) this.removeOrb(orb);
+  }
+
+  toggleFlashlight(light: THREE.SpotLight): void {
+    this.flashlightOn = !this.flashlightOn;
+    light.visible = this.flashlightOn;
+    this.say(this.flashlightOn ? 'Flashlight on.' : 'Flashlight off.');
+  }
+
+  getNoiseLevel(): number {
+    const N = CONFIG.player.noise;
+    return this.hidden ? 0 : this.sprinting ? N.sprint : this.crouching ? N.crouch : N.walk;
+  }
+
+  dispose(): void {
+    this.clearOrbs();
+    this.disposables.dispose();
+  }
+}
+
+
+========== src/rendering/AudioManager.ts ==========
+
+import { DisposableGroup, type Disposable } from '../core/Disposable';
+import { Logger } from '../core/Logger';
+
+export interface AudioSettings {
+  master: number;
+  sfx: number;
+  ambience: number;
+  muted: boolean;
+}
+
+const clamp01 = (v: number): number => Math.min(Math.max(v, 0), 1);
+
+/**
+ * Thin WebAudio wrapper. Every method is safe when the context cannot start,
+ * so gameplay sound events keep working with audio disabled.
+ */
+export class AudioManager implements Disposable {
+  private readonly log = new Logger({ namespace: 'audio' });
+  private readonly group = new DisposableGroup();
+  private context: AudioContext | null = null;
+  private master: GainNode | null = null;
+  private sfxBus: GainNode | null = null;
+  private ambienceBus: GainNode | null = null;
+  private settings: AudioSettings = { master: 0.8, sfx: 0.9, ambience: 0.6, muted: false };
+  private ambienceSource: AudioBufferSourceNode | null = null;
+
+  get available(): boolean {
+    return this.context !== null && this.context.state === 'running';
+  }
+
+  /** Must be called from a user gesture. */
+  async unlock(): Promise<boolean> {
+    if (this.context) {
+      if (this.context.state === 'suspended') await this.context.resume().catch(() => undefined);
+      return this.context.state === 'running';
+    }
+    const Ctor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) {
+      this.log.warnOnce('no-web-audio', 'Web Audio unavailable');
+      return false;
+    }
+    try {
+      this.context = new Ctor();
+      this.master = this.context.createGain();
+      this.sfxBus = this.context.createGain();
+      this.ambienceBus = this.context.createGain();
+      this.sfxBus.connect(this.master);
+      this.ambienceBus.connect(this.master);
+      this.master.connect(this.context.destination);
+      this.applyGains();
+      await this.context.resume();
+      this.group.addFn(() => {
+        this.stopAmbience();
+        void this.context?.close();
+        this.context = null;
+      });
+      return true;
+    } catch (error) {
+      this.log.warn('audio init failed', { error });
+      return false;
+    }
+  }
+
+  private applyGains(): void {
+    const muted = this.settings.muted;
+    if (this.master) this.master.gain.value = muted ? 0 : clamp01(this.settings.master);
+    if (this.sfxBus) this.sfxBus.gain.value = clamp01(this.settings.sfx);
+    if (this.ambienceBus) this.ambienceBus.gain.value = clamp01(this.settings.ambience);
+  }
+
+  applySettings(next: Partial<AudioSettings>): void {
+    this.settings = {
+      master: clamp01(next.master ?? this.settings.master),
+      sfx: clamp01(next.sfx ?? this.settings.sfx),
+      ambience: clamp01(next.ambience ?? this.settings.ambience),
+      muted: next.muted ?? this.settings.muted,
+    };
+    this.applyGains();
+  }
+
+  /** Procedural placeholder blip — no asset files required. */
+  playTone(frequency: number, duration = 0.08, gain = 0.25, bus: 'sfx' | 'ambience' = 'sfx'): void {
+    if (!this.context || !this.sfxBus || !this.ambienceBus) return;
+    const target = bus === 'sfx' ? this.sfxBus : this.ambienceBus;
+    const osc = this.context.createOscillator();
+    const env = this.context.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = frequency;
+    env.gain.setValueAtTime(gain, this.context.currentTime);
+    env.gain.exponentialRampToValueAtTime(0.0001, this.context.currentTime + duration);
+    osc.connect(env);
+    env.connect(target);
+    osc.start();
+    osc.stop(this.context.currentTime + duration);
+  }
+
+  playFootstep(sprinting: boolean): void {
+    this.playTone(sprinting ? 120 : 96, 0.06, sprinting ? 0.22 : 0.12);
+  }
+
+  playImpact(): void {
+    this.playTone(180, 0.1, 0.28);
+  }
+
+  startAmbience(): void {
+    if (!this.context || !this.ambienceBus || this.ambienceSource) return;
+    const osc = this.context.createOscillator();
+    const gain = this.context.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.value = 48;
+    gain.gain.value = 0.05;
+    osc.connect(gain);
+    gain.connect(this.ambienceBus);
+    osc.start();
+    this.ambienceSource = osc as unknown as AudioBufferSourceNode;
+  }
+
+  stopAmbience(): void {
+    try {
+      this.ambienceSource?.stop();
+    } catch {
+      /* already stopped */
+    }
+    this.ambienceSource = null;
+  }
+
+  suspend(): void {
+    void this.context?.suspend();
+  }
+
+  resume(): void {
+    void this.context?.resume();
+  }
+
+  dispose(): void {
+    this.group.dispose();
+  }
+}
+
+
+========== src/save/SaveManager.ts ==========
+
+/**
+ * Versioned, validated save/load. Persists the active run seed (so the keycard position
+ * is stable across a load), and which chapters are completed / unlocked.
+ * Never stores personal data. Fails safe: any corruption just yields a fresh save.
+ */
+
+const SAVE_KEY = 'dftm.save.v1';
+const SAVE_VERSION = 1;
+
+export interface SaveData {
+  version: number;
+  runSeed: number;
+  currentChapterId: string;
+  completedChapterIds: string[];
+  unlockedChapterIds: string[];
+  updatedAt: number;
+}
+
+function isValid(data: unknown): data is SaveData {
+  if (typeof data !== 'object' || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.version === 'number' &&
+    typeof d.runSeed === 'number' &&
+    typeof d.currentChapterId === 'string' &&
+    Array.isArray(d.completedChapterIds) &&
+    d.completedChapterIds.every((x) => typeof x === 'string') &&
+    Array.isArray(d.unlockedChapterIds) &&
+    d.unlockedChapterIds.every((x) => typeof x === 'string') &&
+    typeof d.updatedAt === 'number'
+  );
+}
+
+export function createNewSave(firstChapterId: string, seed: number): SaveData {
+  return {
+    version: SAVE_VERSION,
+    runSeed: seed >>> 0,
+    currentChapterId: firstChapterId,
+    completedChapterIds: [],
+    unlockedChapterIds: [firstChapterId],
+    updatedAt: Date.now(),
+  };
+}
+
+export class SaveManager {
+  /** Returns a valid save, or null if none exists / it is corrupted beyond use. */
+  load(): SaveData | null {
+    let raw: string | null;
+    try {
+      raw = window.localStorage.getItem(SAVE_KEY);
+    } catch {
+      return null; // storage unavailable (private mode, disabled, etc.)
+    }
+    if (!raw) return null;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null; // corrupted JSON
+    }
+
+    if (!isValid(parsed)) return null;
+    if (parsed.version !== SAVE_VERSION) return null; // future format: don't guess-migrate silently
+    return parsed;
+  }
+
+  save(data: SaveData): boolean {
+    try {
+      window.localStorage.setItem(SAVE_KEY, JSON.stringify({ ...data, updatedAt: Date.now() }));
+      return true;
+    } catch {
+      return false; // quota exceeded or storage unavailable; caller should warn, not crash
+    }
+  }
+
+  clear(): void {
+    try {
+      window.localStorage.removeItem(SAVE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  markChapterCompleted(data: SaveData, chapterId: string, nextChapterId: string | null): SaveData {
+    const completed = data.completedChapterIds.includes(chapterId)
+      ? data.completedChapterIds
+      : [...data.completedChapterIds, chapterId];
+    const unlocked = nextChapterId && !data.unlockedChapterIds.includes(nextChapterId)
+      ? [...data.unlockedChapterIds, nextChapterId]
+      : data.unlockedChapterIds;
+    return {
+      ...data,
+      completedChapterIds: completed,
+      unlockedChapterIds: unlocked,
+      currentChapterId: nextChapterId ?? data.currentChapterId,
+      updatedAt: Date.now(),
+    };
+  }
+
+  isUnlocked(data: SaveData, chapterId: string): boolean {
+    return data.unlockedChapterIds.includes(chapterId);
+  }
+}
+
+
+========== src/gameplay/ObjectiveSystem.ts ==========
+
+import type { PlayerController } from '../player/PlayerController';
+import type { WorldManager } from '../world/WorldManager';
+import { CONFIG } from '../app/GameConfig';
+
+/** Deliberately gives no room, direction, or map clue for the randomly placed keycard. */
+export const STARTING_OBJECTIVE = 'Search the facility for a security keycard.';
+
+export function getObjective(hasKeycard: boolean): string {
+  return hasKeycard ? 'Return to the exit and use the security keycard.' : STARTING_OBJECTIVE;
+}
+
+const DEFAULT_PROMPT = 'CLICK TO CAPTURE MOUSE · G THROW DISTRACTION · F FLASHLIGHT';
+
+/** Text for the bottom-centre interaction prompt. */
+export function getInteractionPrompt(player: PlayerController, world: WorldManager): string {
+  if (player.hidden) return 'E  /  LEAVE HIDING PLACE';
+  if (player.position.distanceTo(world.exitPosition) < CONFIG.player.interact.exitRange) {
+    return player.hasKeycard ? 'E  /  UNLOCK EXIT' : 'EXIT LOCKED · SECURITY KEYCARD REQUIRED';
+  }
+  const nearest = world.interactables
+    .filter((i) => i.active && i.position.distanceTo(player.position) < 2.2)
+    .sort((a, b) => a.position.distanceTo(player.position) - b.position.distanceTo(player.position))[0];
+  if (!nearest) return DEFAULT_PROMPT;
+  switch (nearest.kind) {
+    case 'keycard': return 'E  /  PICK UP KEYCARD';
+    case 'hiding': return `E  /  HIDE IN ${nearest.label.toUpperCase()}`;
+    case 'note': return 'E  /  READ NOTE';
+    default: return `E  /  ${nearest.label.toUpperCase()}`;
+  }
+}
+
+
+========== src/ui/GameUI.ts ==========
+
+
+import { DisposableGroup, type Disposable } from '../core/Disposable';
+import type { QualityLevel } from '../core/GameEvents';
+import type { HudState, HUD } from './HUD';
+import { mountUiRoot } from './UiKit';
+import { MainMenu } from './MainMenu';
+import { HowToPlay } from './HowToPlay';
+import { SettingsMenu, type SettingsValues } from './SettingsMenu';
+import { PauseMenu } from './PauseMenu';
+import { CaughtScreen } from './CaughtScreen';
+import { ChapterCompleteScreen } from './ChapterCompleteScreen';
+import { HUD as HudImpl } from './HUD';
+
+export interface GameUIHooks {
+  onNewGame: () => void;
+  onResume: () => void;
+  onRestart: () => void;
+  onMainMenu: () => void;
+  onSettingsChange: (patch: Partial<SettingsValues>) => void;
+  onPauseRequest: () => void;
+}
+
+export interface GameUIBindings {
+  newGame: () => void;
+  showHowTo: () => void;
+  showMenu: () => void;
+  resume: () => void;
+  restart: () => void;
+}
+
+type ScreenName =
+  | 'main'
+  | 'howToPlay'
+  | 'settings'
+  | 'pause'
+  | 'caught'
+  | 'complete'
+  | 'hud';
+
+interface LegacyHudState {
+  objective: unknown;
+  hasKeycard: boolean;
+  monsterDistance: number;
+  hidden: boolean;
+  sprinting: boolean;
+  crouching: boolean;
+  prompt: string | null;
+}
+
+const DEFAULT_SETTINGS: SettingsValues = {
+  mouseSensitivity: 0.0022,
+  masterVolume: 0.8,
+  sfxVolume: 0.8,
+  ambienceVolume: 0.6,
+  quality: 'high',
+  reducedMotion: false,
+};
+
+const DEFAULT_HOOKS: GameUIHooks = {
+  onNewGame: () => undefined,
+  onResume: () => undefined,
+  onRestart: () => undefined,
+  onMainMenu: () => undefined,
+  onSettingsChange: () => undefined,
+  onPauseRequest: () => undefined,
+};
+
+export class GameUI implements Disposable {
+  private readonly group = new DisposableGroup();
+  private readonly root: HTMLDivElement;
+
+  private readonly mainMenu: MainMenu;
+  private readonly howToPlay: HowToPlay;
+  private readonly settings: SettingsMenu;
+  private readonly pause: PauseMenu;
+  private readonly caught: CaughtScreen;
+  private readonly complete: ChapterCompleteScreen;
+
+  readonly hud: HUD;
+
+  private hooks: GameUIHooks;
+  private bindings: GameUIBindings | null = null;
+  private settingsReturn: ScreenName = 'main';
+  private current: ScreenName = 'main';
+  private toastElement: HTMLDivElement;
+  private disposed = false;
+
+  constructor(
+    hooksOrContainer: GameUIHooks | HTMLElement = DEFAULT_HOOKS,
+    settings: SettingsValues = DEFAULT_SETTINGS,
+    endingText = 'Chapter 1 complete.',
+  ) {
+    // The renderer container is not needed by the UI root.
+    this.hooks =
+      hooksOrContainer instanceof HTMLElement
+        ? DEFAULT_HOOKS
+        : hooksOrContainer;
+
+    this.root = mountUiRoot();
+    this.group.addFn(() => this.root.remove());
+
+    this.mainMenu = this.group.add(
+      new MainMenu({
+        onNewGame: () => {
+          if (this.bindings) this.bindings.newGame();
+          else this.hooks.onNewGame();
+        },
+        onHowToPlay: () => {
+          if (this.bindings) this.bindings.showHowTo();
+          else this.show('howToPlay');
+        },
+        onSettings: () => {
+          this.settingsReturn = 'main';
+          this.show('settings');
+        },
+      }),
+    );
+
+    this.howToPlay = this.group.add(
+      new HowToPlay(() => this.show('main')),
+    );
+
+    this.settings = this.group.add(
+      new SettingsMenu(settings, {
+        onChange: (patch) => this.hooks.onSettingsChange(patch),
+        onBack: () => this.show(this.settingsReturn),
+      }),
+    );
+
+    this.pause = this.group.add(
+      new PauseMenu({
+        onResume: () => {
+          if (this.bindings) this.bindings.resume();
+          else this.hooks.onResume();
+        },
+        onRestart: () => {
+          if (this.bindings) this.bindings.restart();
+          else this.hooks.onRestart();
+        },
+        onSettings: () => {
+          this.settingsReturn = 'pause';
+          this.show('settings');
+        },
+        onMainMenu: () => {
+          if (this.bindings) this.bindings.showMenu();
+          else this.hooks.onMainMenu();
+        },
+      }),
+    );
+
+    this.caught = this.group.add(
+      new CaughtScreen(
+        () => this.hooks.onRestart(),
+        () => this.hooks.onMainMenu(),
+      ),
+    );
+
+    this.complete = this.group.add(
+      new ChapterCompleteScreen(
+        endingText,
+        () => this.hooks.onRestart(),
+        () => this.hooks.onMainMenu(),
+      ),
+    );
+
+    this.hud = this.group.add(new HudImpl());
+
+    this.toastElement = document.createElement('div');
+    this.toastElement.className = 'dfm-toast';
+    this.toastElement.setAttribute('role', 'status');
+    this.toastElement.setAttribute('aria-live', 'polite');
+    this.toastElement.hidden = true;
+    this.root.appendChild(this.toastElement);
+
+    this.root.append(
+      this.mainMenu.root,
+      this.howToPlay.root,
+      this.settings.root,
+      this.pause.root,
+      this.caught.root,
+      this.complete.root,
+      this.hud.root,
+    );
+  }
+
+  bind(bindings: GameUIBindings): void {
+    this.bindings = bindings;
+  }
+
+  private hideAll(): void {
+    this.mainMenu.hide();
+    this.howToPlay.hide();
+    this.settings.hide();
+    this.pause.hide();
+    this.caught.hide();
+    this.complete.hide();
+    this.hud.hide();
+  }
+
+  show(screen: ScreenName): void {
+    this.current = screen;
+    this.hideAll();
+
+    switch (screen) {
+      case 'main':
+        this.mainMenu.show();
+        break;
+      case 'howToPlay':
+        this.howToPlay.show();
+        break;
+      case 'settings':
+        this.settings.show();
+        break;
+      case 'pause':
+        this.pause.show();
+        break;
+      case 'caught':
+        this.caught.show();
+        break;
+      case 'complete':
+        this.complete.show();
+        break;
+      case 'hud':
+        this.hud.show();
+        break;
+    }
+  }
+
+  showMenu(): void {
+    this.show('main');
+  }
+
+  showHowTo(): void {
+    this.show('howToPlay');
+  }
+
+  showHud(): void {
+    this.show('hud');
+  }
+
+  showPause(): void {
+    this.show('pause');
+  }
+
+  showCaught(): void {
+    this.show('caught');
+  }
+
+  showComplete(): void {
+    this.show('complete');
+  }
+
+  get activeScreen(): ScreenName {
+    return this.current;
+  }
+
+  setObjective(text: string, index: number, total: number): void {
+    this.hud.objective.set(text, index, total);
+  }
+
+  setPrompt(label: string | null): void {
+    if (label === null) {
+      this.hud.prompt.hide();
+    } else {
+      this.hud.prompt.show(label);
+    }
+  }
+
+  updateHud(state: HudState | LegacyHudState): void {
+    if ('keycard' in state) {
+      this.hud.update(state);
+      return;
+    }
+
+    const gait = state.crouching
+      ? 'crouching'
+      : state.sprinting
+        ? 'sprinting'
+        : 'walking';
+
+    const threat =
+      Number.isFinite(state.monsterDistance) && state.monsterDistance >= 0
+        ? Math.max(0, Math.min(1, 1 - state.monsterDistance / 12))
+        : 0;
+
+    this.hud.update({
+      keycard: state.hasKeycard,
+      hidden: state.hidden,
+      gait,
+      threat,
+    });
+
+    this.setPrompt(state.prompt);
+  }
+
+  toast(text: string): void {
+    this.toastElement.textContent = text;
+    this.toastElement.hidden = text.length === 0;
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.group.dispose();
+  }
+}
+
+export type { HudState, QualityLevel };
+
+
+========== src/core/GameEvents.ts ==========
+
+import type * as THREE from 'three';
+
+export type SoundCategory =
+  | 'footstep'
+  | 'sprint'
+  | 'crouch'
+  | 'landing'
+  | 'interact'
+  | 'door'
+  | 'console'
+  | 'throw'
+  | 'impact'
+  | 'voice';
+
+export interface SoundEvent {
+  readonly id: string;
+  readonly position: THREE.Vector3;
+  /** 0..1 nominal loudness before attenuation. */
+  readonly loudness: number;
+  readonly category: SoundCategory;
+  /** Simulation timestamp (seconds). */
+  readonly time: number;
+  readonly sourceId?: string;
+}
+
+export type MonsterStateName =
+  | 'patrol'
+  | 'investigate'
+  | 'searchLastKnown'
+  | 'chase'
+  | 'searchLost'
+  | 'returnToPatrol'
+  | 'stunned';
+
+export type Gait = 'idle' | 'crouch' | 'walk' | 'sprint';
+
+export type QualityLevel = 'low' | 'medium' | 'high';
+
+export interface GameEventMap {
+  'sound/emit': SoundEvent;
+  'monster/state': { readonly from: MonsterStateName; readonly to: MonsterStateName; readonly reason: string };
+  'monster/threat': { readonly distance: number; readonly state: MonsterStateName };
+  'player/gait': { readonly gait: Gait };
+  'player/hidden': { readonly hidden: boolean; readonly lockerId?: string };
+  'player/caught': { readonly reason: string };
+  'chapter/objective': { readonly stepId: string; readonly text: string; readonly index: number; readonly total: number };
+  'chapter/complete': { readonly chapterId: string };
+  'game/pause': { readonly reason: string };
+  'game/resume': Record<string, never>;
+  'settings/changed': {
+    readonly mouseSensitivity?: number;
+    readonly masterVolume?: number;
+    readonly sfxVolume?: number;
+    readonly ambienceVolume?: number;
+    readonly quality?: QualityLevel;
+    readonly reducedMotion?: boolean;
+  };
+  'audio/blocked': { readonly reason: string };
+}
+
+
+========== src/chapters/CampaignIndex.ts ==========
+
+import { CHAPTER_01_CAMPAIGN } from './Chapter01_Containment';
+import { CHAPTER_02 } from './Chapter02_ForgottenExperiments';
+import { CHAPTER_03 } from './Chapter03_SilentWard';
+import { CHAPTER_04 } from './Chapter04_PowerFailure';
+import { CHAPTER_05 } from './Chapter05_Project09';
+import type { ChapterAIProfile } from './ChapterAIProfile';
+
+export interface CampaignChapter {
+  readonly id: string; readonly title: string; readonly areaId: string;
+  readonly unlockAfter: string | null; readonly objective: string;
+  readonly storyBrief: string; readonly ai: ChapterAIProfile;
+}
+export const CAMPAIGN_CHAPTERS: readonly CampaignChapter[] = [
+  { id: CHAPTER_01_CAMPAIGN.id, title: CHAPTER_01_CAMPAIGN.title, areaId: 'containment-block',
+    unlockAfter: null, objective: 'Search the facility for a security keycard.',
+    storyBrief: CHAPTER_01_CAMPAIGN.storyBrief, ai: CHAPTER_01_CAMPAIGN.ai },
+  CHAPTER_02, CHAPTER_03, CHAPTER_04, CHAPTER_05,
+];
+export function getCampaignChapter(id: string): CampaignChapter | undefined {
+  return CAMPAIGN_CHAPTERS.find((chapter) => chapter.id === id);
+}
+export function getNextChapter(id: string): CampaignChapter | undefined {
+  const index = CAMPAIGN_CHAPTERS.findIndex((chapter) => chapter.id === id);
+  return index >= 0 ? CAMPAIGN_CHAPTERS[index + 1] : undefined;
+}

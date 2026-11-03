@@ -1,0 +1,794 @@
+﻿
+========== src\rendering\RendererManager.ts ==========
+import * as THREE from 'three';
+import { DisposableStore, type Disposable } from '../core/Disposable';
+import { CONFIG } from '../app/GameConfig';
+
+export class RendererManager implements Disposable {
+  readonly renderer: THREE.WebGLRenderer;
+  readonly canvas: HTMLCanvasElement;
+  onContextLost: (() => void) | null = null;
+  onContextRestored: (() => void) | null = null;
+  private camera: THREE.PerspectiveCamera | null = null;
+  private contextLost = false;
+  private readonly disposables = new DisposableStore();
+
+  constructor(container: HTMLElement) {
+    // Throws if WebGL is unavailable; GameBootstrap turns that into a readable message.
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    this.canvas = this.renderer.domElement;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, CONFIG.renderer.maxPixelRatio));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = CONFIG.renderer.toneMappingExposure;
+    container.appendChild(this.canvas);
+
+    this.disposables.addListener(window, 'resize', this.handleResize);
+    this.disposables.addListener(this.canvas, 'webglcontextlost', ((e: Event) => {
+      e.preventDefault();
+      this.contextLost = true;
+      this.onContextLost?.();
+    }) as EventListener);
+    this.disposables.addListener(this.canvas, 'webglcontextrestored', (() => {
+      this.contextLost = false;
+      this.onContextRestored?.();
+    }) as EventListener);
+  }
+
+  attachCamera(camera: THREE.PerspectiveCamera): void {
+    this.camera = camera;
+    this.handleResize();
+  }
+
+  private handleResize = (): void => {
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    if (this.camera) {
+      this.camera.aspect = window.innerWidth / window.innerHeight;
+      this.camera.updateProjectionMatrix();
+    }
+  };
+
+  render(scene: THREE.Scene): void {
+    if (this.contextLost || !this.camera) return;
+    this.renderer.render(scene, this.camera);
+  }
+
+  dispose(): void {
+    this.disposables.dispose();
+    this.renderer.dispose();
+    this.renderer.forceContextLoss();
+    this.canvas.remove();
+  }
+}
+
+
+========== src\core\EventBus.ts ==========
+
+import type { Disposable } from './Disposable';
+import { Logger } from './Logger';
+
+export type Listener<T> = (payload: T) => void;
+
+const log = new Logger({ namespace: 'eventbus' });
+
+export class EventBus<
+  M extends object = Record<string, any>,
+> implements Disposable {
+  private readonly map = new Map<
+    keyof M,
+    Set<Listener<any>>
+  >();
+
+  private _disposed = false;
+
+  get disposed(): boolean {
+    return this._disposed;
+  }
+
+  on<K extends keyof M>(
+    type: K,
+    listener: Listener<M[K]>,
+  ): () => void {
+    if (this._disposed) {
+      return () => undefined;
+    }
+
+    let listeners = this.map.get(type);
+
+    if (!listeners) {
+      listeners = new Set<Listener<any>>();
+      this.map.set(type, listeners);
+    }
+
+    listeners.add(listener);
+
+    return () => this.off(type, listener);
+  }
+
+  once<K extends keyof M>(
+    type: K,
+    listener: Listener<M[K]>,
+  ): () => void {
+    let unsubscribe: (() => void) | undefined;
+
+    const wrapped: Listener<M[K]> = (payload) => {
+      unsubscribe?.();
+      listener(payload);
+    };
+
+    unsubscribe = this.on(type, wrapped);
+    return unsubscribe;
+  }
+
+  off<K extends keyof M>(
+    type: K,
+    listener: Listener<M[K]>,
+  ): void {
+    const listeners = this.map.get(type);
+    if (!listeners) return;
+
+    listeners.delete(listener);
+
+    if (listeners.size === 0) {
+      this.map.delete(type);
+    }
+  }
+
+  emit<K extends keyof M>(
+    type: K,
+    payload: M[K],
+  ): void {
+    if (this._disposed) return;
+
+    const listeners = this.map.get(type);
+    if (!listeners) return;
+
+    for (const listener of Array.from(listeners)) {
+      try {
+        listener(payload);
+      } catch (error: unknown) {
+        log.error('listener threw', {
+          type: String(type),
+          error,
+        });
+      }
+    }
+  }
+
+  listenerCount(type?: keyof M): number {
+    if (type !== undefined) {
+      return this.map.get(type)?.size ?? 0;
+    }
+
+    let total = 0;
+
+    for (const listeners of this.map.values()) {
+      total += listeners.size;
+    }
+
+    return total;
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  dispose(): void {
+    if (this._disposed) return;
+
+    this._disposed = true;
+    this.map.clear();
+  }
+}
+
+
+========== src\Documents\PaperPickups.ts ==========
+import * as THREE from 'three';
+
+import { DOCUMENTS } from './DocumentRegistry';
+
+import type {
+  HorrorGameHooks
+} from '../integration/GameHooks';
+
+export interface PaperPlacement {
+  docId: string;
+  x: number;
+  z: number;
+  rotationY: number;
+  surfaceY?: number;
+}
+
+export class PaperPickups {
+  private readonly items: {
+    mesh: THREE.Mesh;
+    docId: string;
+    pos: THREE.Vector3;
+  }[] = [];
+
+  private readonly disposers: (() => void)[] = [];
+
+  private readonly geometry =
+    new THREE.PlaneGeometry(0.30, 0.42);
+
+  private readonly raycaster = new THREE.Raycaster();
+
+  private nearest: THREE.Mesh | null = null;
+  private promptElement: HTMLDivElement | null = null;
+
+  constructor(
+    private readonly scene: THREE.Scene,
+    private readonly hooks: HorrorGameHooks,
+    private readonly isBlocked: () => boolean,
+    private readonly onRead: (docId: string) => void
+  ) {}
+
+  place(placements: readonly PaperPlacement[]): void {
+    for (const placement of placements) {
+      if (!DOCUMENTS.some(
+        doc => doc.id === placement.docId
+      )) {
+        console.warn(
+          `[papers] Unknown docId: ${placement.docId}`
+        );
+        continue;
+      }
+
+      const resolvedY =
+        placement.surfaceY ??
+        this.resolveY(placement.x, placement.z);
+
+      if (resolvedY === null) {
+        console.warn(
+          `[papers] No surface under ${placement.docId}; using y=0`
+        );
+      }
+
+      const material = new THREE.MeshStandardMaterial({
+        color: 0xcfc3a4,
+        roughness: 0.95,
+        side: THREE.DoubleSide
+      });
+
+      const mesh = new THREE.Mesh(
+        this.geometry,
+        material
+      );
+
+      mesh.position.set(
+        placement.x,
+        (resolvedY ?? 0) + 0.012,
+        placement.z
+      );
+
+      mesh.rotation.set(
+        -Math.PI / 2 + 0.03,
+        placement.rotationY,
+        0
+      );
+
+      mesh.userData.docId = placement.docId;
+
+      this.scene.add(mesh);
+
+      this.items.push({
+        mesh,
+        docId: placement.docId,
+        pos: mesh.position.clone()
+      });
+
+      if (this.hooks.interaction) {
+        const dispose = this.hooks.interaction.register(
+          mesh,
+          {
+            prompt: '[E] Read',
+            radius: 1.6,
+            onInteract: () => this.onRead(placement.docId)
+          }
+        );
+
+        this.disposers.push(dispose);
+      }
+    }
+
+    if (!this.hooks.interaction) {
+      this.mountPrompt();
+    }
+  }
+
+  update(): void {
+    if (this.hooks.interaction || this.isBlocked()) {
+      if (this.promptElement) {
+        this.promptElement.style.opacity = '0';
+      }
+
+      return;
+    }
+
+    const playerPosition =
+      this.hooks.getPlayerPosition();
+
+    let best: THREE.Mesh | null = null;
+    let bestDistance = 1.7;
+
+    for (const item of this.items) {
+      const distance = playerPosition.distanceTo(item.pos);
+
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = item.mesh;
+      }
+    }
+
+    this.nearest = best;
+
+    if (this.promptElement) {
+      this.promptElement.style.opacity =
+        best ? '1' : '0';
+    }
+  }
+
+  dispose(): void {
+    this.disposers.forEach(dispose => dispose());
+    this.disposers.length = 0;
+
+    this.items.forEach(item => {
+      this.scene.remove(item.mesh);
+
+      const material =
+        item.mesh.material as THREE.Material;
+
+      material.dispose();
+    });
+
+    this.items.length = 0;
+
+    this.geometry.dispose();
+
+    this.promptElement?.remove();
+    this.promptElement = null;
+
+    window.removeEventListener('keydown', this.onKey);
+  }
+
+  private readonly onKey = (
+    event: KeyboardEvent
+  ): void => {
+    if (event.code !== 'KeyE') return;
+    if (this.isBlocked()) return;
+    if (!this.nearest) return;
+
+    event.preventDefault();
+
+    const docId = this.nearest.userData.docId as string;
+
+    this.onRead(docId);
+  };
+
+  private resolveY(
+    x: number,
+    z: number
+  ): number | null {
+    this.raycaster.set(
+      new THREE.Vector3(x, 40, z),
+      new THREE.Vector3(0, -1, 0)
+    );
+
+    this.raycaster.far = 80;
+
+    const hits = this.raycaster.intersectObjects(
+      this.hooks.getOccluders(),
+      true
+    );
+
+    return hits.length > 0
+      ? hits[0].point.y
+      : null;
+  }
+
+  private mountPrompt(): void {
+    const element = document.createElement('div');
+
+    element.className = 'dfm-paper-prompt';
+    element.textContent = '[E] Read';
+
+    element.style.cssText = `
+      position:fixed;
+      left:50%;
+      bottom:22%;
+      transform:translateX(-50%);
+      opacity:0;
+      transition:opacity .18s;
+      pointer-events:none;
+      letter-spacing:.18em;
+      font:600 13px/1 ui-monospace,monospace;
+      color:#e8dcc0;
+      text-shadow:0 0 12px #000;
+      z-index:30
+    `;
+
+    document.body.appendChild(element);
+
+    this.promptElement = element;
+
+    window.addEventListener('keydown', this.onKey);
+  }
+}
+
+========== src\Documents\PaperReader.ts ==========
+import * as THREE from 'three';
+
+import { buildPaperTexture } from './PaperTextureFactory';
+import {
+  DOCUMENTS,
+  type GameDocument
+} from './DocumentRegistry';
+
+import { HandRig } from './HandRig';
+
+const NEAR_Z = -0.36;
+const FAR_Z = -0.58;
+
+export interface PaperReaderDeps {
+  renderer: THREE.WebGLRenderer;
+  setPlayerInputEnabled(enabled: boolean): void;
+  onCollected(id: string): void;
+  onOpenChange(open: boolean): void;
+}
+
+export class PaperReader {
+  private opened = false;
+
+  get isOpen(): boolean {
+    return this.opened;
+  }
+
+  private doc: GameDocument | null = null;
+  private page = 0;
+  private zoom = 0;
+  private sway = 0;
+
+  private readonly scene = new THREE.Scene();
+
+  private readonly camera =
+    new THREE.PerspectiveCamera(48, 1, 0.01, 4);
+
+  private readonly hand = new HandRig();
+
+  private paper: THREE.Mesh | null = null;
+  private counter: HTMLDivElement | null = null;
+
+  private readonly onWheel = (event: WheelEvent): void => {
+    if (!this.opened) return;
+
+    event.preventDefault();
+
+    this.setZoom(
+      this.zoom + (event.deltaY > 0 ? -0.12 : 0.12)
+    );
+  };
+
+  private readonly onKey = (event: KeyboardEvent): void => {
+    if (!this.opened) return;
+
+    switch (event.code) {
+      case 'Escape':
+      case 'KeyE':
+        event.preventDefault();
+        this.close();
+        break;
+
+      case 'KeyA':
+      case 'ArrowLeft':
+        event.preventDefault();
+        this.flip(-1);
+        break;
+
+      case 'KeyD':
+      case 'ArrowRight':
+        event.preventDefault();
+        this.flip(1);
+        break;
+
+      case 'Equal':
+      case 'ArrowUp':
+        event.preventDefault();
+        this.setZoom(this.zoom + 0.15);
+        break;
+
+      case 'Minus':
+      case 'ArrowDown':
+        event.preventDefault();
+        this.setZoom(this.zoom - 0.15);
+        break;
+    }
+  };
+
+  constructor(private readonly deps: PaperReaderDeps) {
+    this.scene.add(
+      new THREE.AmbientLight(0xffffff, 0.55)
+    );
+
+    const key = new THREE.PointLight(
+      0xfff0d8,
+      2.2,
+      3,
+      1.4
+    );
+
+    key.position.set(0.35, 0.5, 0.4);
+    this.scene.add(key);
+
+    const rim = new THREE.PointLight(
+      0xff5a3c,
+      0.9,
+      3,
+      1.6
+    );
+
+    rim.position.set(-0.6, -0.2, -0.1);
+    this.scene.add(rim);
+
+    this.hand.group.position.set(
+      0.17,
+      -0.30,
+      -0.29
+    );
+
+    this.hand.group.rotation.set(
+      -0.35,
+      0,
+      -0.3
+    );
+
+    this.scene.add(this.hand.group);
+
+    window.addEventListener('keydown', this.onKey);
+  }
+
+  open(docId: string): void {
+    if (this.opened) return;
+
+    const doc = DOCUMENTS.find(
+      item => item.id === docId
+    );
+
+    if (!doc) {
+      console.warn(`[papers] Unknown document: ${docId}`);
+      return;
+    }
+
+    this.opened = true;
+    this.doc = doc;
+    this.page = 0;
+    this.zoom = 0;
+
+    this.buildPage();
+    this.mountHud();
+
+    this.deps.setPlayerInputEnabled(false);
+    this.deps.onOpenChange(true);
+    this.deps.onCollected(doc.id);
+
+    window.addEventListener(
+      'wheel',
+      this.onWheel,
+      { passive: false }
+    );
+  }
+
+  close(): void {
+    if (!this.opened) return;
+
+    this.opened = false;
+
+    this.disposePage();
+    this.unmountHud();
+
+    window.removeEventListener('wheel', this.onWheel);
+
+    this.doc = null;
+
+    this.deps.setPlayerInputEnabled(true);
+    this.deps.onOpenChange(false);
+  }
+
+  flip(direction: number): void {
+    if (!this.doc) return;
+
+    const next = THREE.MathUtils.clamp(
+      this.page + direction,
+      0,
+      this.doc.pages.length - 1
+    );
+
+    if (next === this.page) return;
+
+    this.page = next;
+
+    this.buildPage();
+    this.updateCounter();
+  }
+
+  setZoom(value: number): void {
+    this.zoom = THREE.MathUtils.clamp(value, 0, 1);
+  }
+
+  update(deltaTime: number): void {
+    if (!this.paper) return;
+
+    this.sway += deltaTime;
+
+    const targetZ = THREE.MathUtils.lerp(
+      FAR_Z,
+      NEAR_Z,
+      this.zoom
+    );
+
+    this.paper.position.z = THREE.MathUtils.damp(
+      this.paper.position.z,
+      targetZ,
+      8,
+      deltaTime
+    );
+
+    this.paper.position.y =
+      -0.02 + Math.sin(this.sway * 1.3) * 0.003;
+
+    this.paper.rotation.z =
+      Math.sin(this.sway * 0.6) * 0.006;
+
+    this.paper.scale.setScalar(
+      THREE.MathUtils.lerp(1, 1.18, this.zoom)
+    );
+
+    this.hand.group.position.y =
+      -0.30 + Math.sin(this.sway * 0.75) * 0.0025;
+  }
+
+  render(): void {
+    if (!this.opened) return;
+
+    this.deps.renderer.clearDepth();
+    this.deps.renderer.render(this.scene, this.camera);
+  }
+
+  resize(width: number, height: number): void {
+    this.camera.aspect = width / Math.max(1, height);
+    this.camera.updateProjectionMatrix();
+  }
+
+  dispose(): void {
+    window.removeEventListener('keydown', this.onKey);
+    window.removeEventListener('wheel', this.onWheel);
+
+    this.disposePage();
+    this.unmountHud();
+    this.hand.dispose();
+  }
+
+  private buildPage(): void {
+    this.disposePage();
+
+    if (!this.doc) return;
+
+    const textures = buildPaperTexture(
+      this.doc.pages[this.page] ?? '',
+      this.page + 1,
+      this.doc.pages.length
+    );
+
+    const geometry = new THREE.PlaneGeometry(
+      0.52,
+      0.735,
+      28,
+      28
+    );
+
+    const positions =
+      geometry.attributes.position as THREE.BufferAttribute;
+
+    for (let i = 0; i < positions.count; i++) {
+      const u = (positions.getX(i) + 0.26) / 0.52;
+      const v = (positions.getY(i) + 0.3675) / 0.735;
+
+      positions.setZ(
+        i,
+        Math.sin(u * Math.PI) * 0.012 +
+        Math.sin(v * Math.PI) * 0.006
+      );
+    }
+
+    geometry.computeVertexNormals();
+
+    const material = new THREE.MeshStandardMaterial({
+      map: textures.map,
+      bumpMap: textures.bump,
+      bumpScale: 0.02,
+      roughness: 0.94,
+      metalness: 0,
+      side: THREE.DoubleSide,
+      transparent: true
+    });
+
+    const mesh = new THREE.Mesh(
+      geometry,
+      material
+    );
+
+    mesh.position.set(0, -0.02, FAR_Z);
+    mesh.rotation.x = -0.06;
+    mesh.renderOrder = 10;
+
+    this.scene.add(mesh);
+    this.paper = mesh;
+
+    this.updateCounter();
+  }
+
+  private disposePage(): void {
+    if (!this.paper) return;
+
+    this.paper.geometry.dispose();
+
+    const material =
+      this.paper.material as THREE.MeshStandardMaterial;
+
+    material.map?.dispose();
+    material.bumpMap?.dispose();
+    material.dispose();
+
+    this.scene.remove(this.paper);
+    this.paper = null;
+  }
+
+  private mountHud(): void {
+    const element = document.createElement('div');
+
+    element.style.cssText = `
+      position:fixed;
+      left:50%;
+      bottom:4.5vh;
+      transform:translateX(-50%);
+      z-index:40;
+      display:flex;
+      gap:22px;
+      align-items:center;
+      font:600 11px/1 ui-monospace,monospace;
+      letter-spacing:.2em;
+      color:#a99e88;
+      text-shadow:0 0 10px #000;
+      pointer-events:none
+    `;
+
+    element.innerHTML = `
+      <span>A / D â€” FLIP</span>
+      <span>WHEEL â€” ZOOM</span>
+      <span id="paper-counter">1 / 1</span>
+      <span>E â€” CLOSE</span>
+    `;
+
+    document.body.appendChild(element);
+
+    this.counter = element;
+    this.updateCounter();
+  }
+
+  private unmountHud(): void {
+    this.counter?.remove();
+    this.counter = null;
+  }
+
+  private updateCounter(): void {
+    const counter =
+      this.counter?.querySelector('#paper-counter');
+
+    if (counter && this.doc) {
+      counter.textContent =
+        `${this.page + 1} / ${this.doc.pages.length}`;
+    }
+  }
+}
